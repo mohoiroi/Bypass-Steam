@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::{
 
 fn main() {
     if std::env::args().any(|a| a == "off") {
-        proxy::set_pac(false);
+        proxy::reset_network_proxy();
         return;
     }
     let start_minimized = std::env::args().any(|a| a == "--minimized");
@@ -38,9 +38,10 @@ fn main() {
     }
 
     config::sync_autostart_path();
-    proxy::init_custom_domains();
+    proxy::init_settings();
     proxy::seed_stats();
     proxy::set_enabled(true);
+    proxy::start_network_watcher();
 
     let _gdip = gfx::GdiplusGuard::new();
     ui::run(start_minimized);

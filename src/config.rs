@@ -1,4 +1,4 @@
-//! Persistent configuration in HKCU Registry: Windows autostart and custom bypass domains.
+//! Persistent configuration in HKCU Registry: Windows autostart, Direct CDN, and custom domains.
 
 use crate::proxy::wide;
 use std::ptr::null_mut;
@@ -9,6 +9,13 @@ const RUN_VALUE: &str = "SteamBypass";
 
 const APP_KEY: &str = r"Software\SteamBypass";
 const CUSTOM_DOMAINS_VALUE: &str = "CustomDomains";
+const DIRECT_CDN_VALUE: &str = "DirectCdn";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomDomain {
+    pub domain: String,
+    pub enabled: bool,
+}
 
 fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
     let key_w = wide(subkey);
@@ -122,45 +129,59 @@ pub fn sync_autostart_path() {
     }
 }
 
+// ---------------- Direct CDN Toggle ----------------
+pub fn load_direct_cdn() -> bool {
+    read_reg_sz(APP_KEY, DIRECT_CDN_VALUE)
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+pub fn save_direct_cdn(direct: bool) -> bool {
+    write_reg_sz(APP_KEY, DIRECT_CDN_VALUE, if direct { "1" } else { "0" })
+}
+
 // ---------------- Custom Domains ----------------
+/// Split a user-pasted string containing one or multiple domains separated by newlines, commas, semicolons, or spaces.
+pub fn split_domain_tokens(raw: &str) -> Vec<&str> {
+    raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Normalize user input (bare domain, wildcard, or pasted URL) into a clean lowercase domain.
 pub fn normalize_domain(raw: &str) -> Result<String, &'static str> {
     let mut s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
-        return Err("Hãy nhập tên miền (vd: reddit.com)");
+        return Err("Hãy nhập tên miền (vd: bbc.com)");
     }
     if let Some(rest) = s.strip_prefix("https://") {
         s = rest.to_string();
     } else if let Some(rest) = s.strip_prefix("http://") {
         s = rest.to_string();
     }
-    // Strip path, query, fragment, whitespace
     if let Some(idx) = s.find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace()) {
         s.truncate(idx);
     }
-    // Strip optional userinfo@
     if let Some((_, host)) = s.rsplit_once('@') {
         s = host.to_string();
     }
-    // Strip optional :port
     if let Some((host, port)) = s.rsplit_once(':') {
         if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
             s = host.to_string();
         }
     }
-    // Strip leading wildcards / dots and trailing dots
     while let Some(rest) = s.strip_prefix("*.") {
         s = rest.to_string();
     }
     let s = s.trim_matches('.');
-    // Strip leading "www." if at least two labels remain (e.g. www.reddit.com -> reddit.com)
     let s = match s.strip_prefix("www.") {
         Some(rest) if rest.contains('.') => rest,
         _ => s,
     };
 
     if s.len() < 3 || s.len() > 253 || !s.contains('.') {
-        return Err("Tên miền không hợp lệ (vd: reddit.com)");
+        return Err("Tên miền không hợp lệ (vd: bbc.com)");
     }
     let labels: Vec<&str> = s.split('.').collect();
     if labels.len() < 2 {
@@ -185,23 +206,49 @@ pub fn normalize_domain(raw: &str) -> Result<String, &'static str> {
     Ok(s.to_string())
 }
 
-pub fn load_custom_domains() -> Vec<String> {
-    let Some(raw) = read_reg_sz(APP_KEY, CUSTOM_DOMAINS_VALUE) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
+pub(crate) fn parse_stored_domains(raw: &str) -> Vec<CustomDomain> {
+    let mut out: Vec<CustomDomain> = Vec::new();
     for line in raw.lines() {
-        if let Ok(d) = normalize_domain(line) {
-            if !out.contains(&d) {
-                out.push(d);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (enabled, rest) = match trimmed.strip_prefix('!') {
+            Some(r) => (false, r),
+            None => (true, trimmed),
+        };
+        if let Ok(d) = normalize_domain(rest) {
+            if !out.iter().any(|x| x.domain == d) {
+                out.push(CustomDomain { domain: d, enabled });
             }
         }
     }
     out
 }
 
-pub fn save_custom_domains(domains: &[String]) -> bool {
-    let joined = domains.join("\n");
+pub(crate) fn serialize_stored_domains(domains: &[CustomDomain]) -> String {
+    domains
+        .iter()
+        .map(|d| {
+            if d.enabled {
+                d.domain.clone()
+            } else {
+                format!("!{}", d.domain)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn load_custom_domains() -> Vec<CustomDomain> {
+    let Some(raw) = read_reg_sz(APP_KEY, CUSTOM_DOMAINS_VALUE) else {
+        return Vec::new();
+    };
+    parse_stored_domains(&raw)
+}
+
+pub fn save_custom_domains(domains: &[CustomDomain]) -> bool {
+    let joined = serialize_stored_domains(domains);
     write_reg_sz(APP_KEY, CUSTOM_DOMAINS_VALUE, &joined)
 }
 
@@ -227,5 +274,19 @@ mod tests {
         assert!(normalize_domain("-bad.com").is_err());
         assert!(normalize_domain("bad..com").is_err());
         assert!(normalize_domain("bad host.com").is_err());
+    }
+
+    #[test]
+    fn splits_and_serializes_multi_domains() {
+        let tokens = split_domain_tokens("bbc.com, https://medium.com/a;\nimgur.com  pixiv.net");
+        assert_eq!(tokens, vec!["bbc.com", "https://medium.com/a", "imgur.com", "pixiv.net"]);
+
+        let list = vec![
+            CustomDomain { domain: "bbc.com".into(), enabled: true },
+            CustomDomain { domain: "medium.com".into(), enabled: false },
+        ];
+        let raw = serialize_stored_domains(&list);
+        assert_eq!(raw, "bbc.com\n!medium.com");
+        assert_eq!(parse_stored_domains(&raw), list);
     }
 }

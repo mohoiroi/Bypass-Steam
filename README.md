@@ -6,16 +6,17 @@
 - Không cần cài đặt, nhấp đúp là chạy ngay.
 
 ## Tính năng
-- **Chống chặn DNS (DNS-over-HTTPS):** Phân giải IP thật qua Cloudflare (`1.1.1.1` / `1.0.0.1`) và dự phòng Google (`8.8.8.8`).
-- **Chống chặn SNI/DPI:** Tách gói TLS `ClientHello` tại proxy cục bộ `127.0.0.1:8899`.
-- **Chỉ định tuyến lưu lượng cần bypass:** Tự động cấu hình file PAC (`proxy.pac`) trên Windows cho Steam và các tên miền bạn tự thêm, không ảnh hưởng các trang web khác.
-- **Thêm tên miền web khác (tab *Web khác*):** Nhập hoặc dán đường dẫn/tên miền (ví dụ `bbc.com`, `medium.com`, `reddit.com`) để vượt chặn DNS/DPI nhà mạng cho các trang web ngoài Steam, tự lưu cài đặt và xóa từng mục dễ dàng. *(Lưu ý: chỉ vượt chặn từ phía nhà mạng; các trang tự chặn IP quốc gia / WAF lỗi `403` cần VPN đổi IP.)*
-- **Khởi chạy cùng Windows:** Tùy chọn tự khởi động ẩn dưới khay hệ thống (`--minimized`) khi mở máy (có sẵn trên giao diện và menu khay hệ thống).
-- **Giao diện gọn nhẹ & khay hệ thống:**
-  - Theo dõi trạng thái bypass theo các nhóm dịch vụ Steam (**Cửa hàng**, **Cộng đồng**, **Đăng nhập & API**, **Tải game (CDN)**, **Hình ảnh & media**) và nhóm **Web tùy chỉnh**.
-  - Nhấp vào từng nhóm để xem tên miền chi tiết, trạng thái DNS và IP đang dùng.
-  - Đóng cửa sổ (`×`) sẽ thu gọn xuống khay hệ thống; bấm **Thoát** sẽ tự gỡ cấu hình proxy.
-- **Chạy độc lập:** File `.exe` duy nhất (~395 KB, RAM ~8,5 MB), không cần cài thêm thư viện ngoài.
+- **Chống chặn DNS (DNS-over-HTTPS):** Phân giải IP thật qua Cloudflare (`1.1.1.1` / `1.0.0.1`) và dự phòng Google (`8.8.8.8`), tự thử nhiều IP CDN nếu IP đầu lỗi.
+- **Chống chặn SNI/DPI:** Tách gói TLS `ClientHello` (HTTPS) và HTTP tại proxy cục bộ `127.0.0.1:8899`.
+- **Đi thẳng CDN tải game:** Tùy chọn giữ nguyên tốc độ tải game gốc từ cache nội mạng VN (bỏ qua proxy cho `steamcontent.com`, `akamaihd.net`) trong khi vẫn bypass Store, Cộng đồng và Đăng nhập.
+- **Thêm tên miền web khác (tab *Web khác*):**
+  - Nhập hoặc dán **nhiều tên miền cùng lúc** (cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng).
+  - Gợi ý 1-click các trang hay bị chặn DPI (`bbc.com`, `medium.com`, `reddit.com`, `imgur.com`, `pixiv.net`).
+  - Có công tắc **bật/tắt tạm từng trang** mà không cần xóa, tự lưu cài đặt bền vững.
+  - *(Lưu ý: chỉ vượt chặn DNS/DPI nhà mạng; trang tự chặn IP quốc gia/WAF lỗi `403` cần VPN.)*
+- **Khởi chạy cùng Windows:** Tự động chạy ẩn dưới khay hệ thống (`--minimized`) khi mở máy.
+- **Tự phục hồi kết nối:** Tự xóa cache DNS và kiểm tra lại khi máy thức dậy sau Sleep hoặc khi đổi Wi-Fi/LAN; kèm nút **Khôi phục mạng (Gỡ proxy)** ngay trong menu khay hệ thống.
+- **Chạy độc lập:** File `.exe` duy nhất (~410 KB, RAM ~9 MB), không cần cài thư viện ngoài hay quyền Admin.
 
 ## Cách sử dụng
 1. Chạy `steam_bypass.exe` (không cần quyền Admin).
