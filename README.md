@@ -9,7 +9,7 @@
 - **Chống chặn DNS (DNS-over-HTTPS):** Phân giải IP thật qua Cloudflare (`1.1.1.1` / `1.0.0.1`) và dự phòng Google (`8.8.8.8`).
 - **Chống chặn SNI/DPI:** Tách gói TLS `ClientHello` tại proxy cục bộ `127.0.0.1:8899`.
 - **Chỉ định tuyến lưu lượng cần bypass:** Tự động cấu hình file PAC (`proxy.pac`) trên Windows cho Steam và các tên miền bạn tự thêm, không ảnh hưởng các trang web khác.
-- **Thêm tên miền web khác:** Nhập hoặc dán đường dẫn/tên miền (ví dụ `reddit.com`, `x.com`, `medium.com`) ngay trên giao diện để bypass thêm trang web ngoài Steam, tự lưu cài đặt và xóa dễ dàng từng mục.
+- **Thêm tên miền web khác (tab *Web khác*):** Nhập hoặc dán đường dẫn/tên miền (ví dụ `bbc.com`, `medium.com`, `reddit.com`) để vượt chặn DNS/DPI nhà mạng cho các trang web ngoài Steam, tự lưu cài đặt và xóa từng mục dễ dàng. *(Lưu ý: chỉ vượt chặn từ phía nhà mạng; các trang tự chặn IP quốc gia / WAF lỗi `403` cần VPN đổi IP.)*
 - **Khởi chạy cùng Windows:** Tùy chọn tự khởi động ẩn dưới khay hệ thống (`--minimized`) khi mở máy (có sẵn trên giao diện và menu khay hệ thống).
 - **Giao diện gọn nhẹ & khay hệ thống:**
   - Theo dõi trạng thái bypass theo các nhóm dịch vụ Steam (**Cửa hàng**, **Cộng đồng**, **Đăng nhập & API**, **Tải game (CDN)**, **Hình ảnh & media**) và nhóm **Web tùy chỉnh**.

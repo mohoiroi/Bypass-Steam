@@ -1,10 +1,10 @@
-//! Pure Win32 + GDI+ window, system tray, custom domain input, and compact accordion UI.
+//! Pure Win32 + GDI+ window, system tray, segmented tabs, and standardized 8px-grid UI.
 
 use crate::config;
 use crate::gfx::{Canvas, FontSet, RectF};
 use crate::proxy::{
     self, APP_TITLE, CUSTOM_GROUP_IDX, DnsState, ENABLED, GROUPS, PENDING, PORT, Stat, UI_DIRTY,
-    WM_APP_STATS, wide,
+    WM_APP_STATS, domain_matches, wide,
 };
 use crate::theme::*;
 use std::ptr::{null, null_mut};
@@ -47,14 +47,29 @@ const ID_MENU_TEST: usize = 3;
 const ID_MENU_AUTOSTART: usize = 4;
 const ID_MENU_EXIT: usize = 5;
 
-const ADD_BAR_Y: f32 = 138.0;
-const ADD_BAR_H: f32 = 34.0;
+// Standardized vertical layout anchors (8px grid)
+const HERO_Y: f32 = 16.0;
+const HERO_H: f32 = 76.0;
+const NAV_Y: f32 = 104.0;
+const NAV_H: f32 = 34.0;
+const CARD_Y: f32 = 150.0;
+const FOOTER_RESERVE: f32 = 48.0;
+
+const INPUT_PAD: f32 = 12.0;
+const INPUT_H: f32 = 34.0;
 const ADD_BTN_W: f32 = 78.0;
 const ADD_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Steam,
+    Custom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     ToggleBypass,
+    SelectTab(Tab),
     RunTest,
     FocusInput,
     AddDomain,
@@ -67,13 +82,14 @@ enum Action {
 struct UiState {
     dpi: u32,
     fonts: FontSet,
+    tab: Tab,
     hover: Option<Action>,
     tracking_mouse: bool,
     expanded: [bool; GROUPS.len()],
-    scroll_y: f32,
+    scroll_steam: f32,
+    scroll_custom: f32,
     max_scroll: f32,
-    scroll_to_bottom: bool,
-    services_rect: RectF,
+    scroll_custom_to_bottom: bool,
     toggle_t: f32,
     spin_deg: f32,
     anim_timer: bool,
@@ -95,17 +111,18 @@ impl UiState {
         Self {
             dpi,
             fonts: FontSet::new(dpi),
+            tab: Tab::Steam,
             hover: None,
             tracking_mouse: false,
             expanded: [false; GROUPS.len()],
-            scroll_y: 0.0,
+            scroll_steam: 0.0,
+            scroll_custom: 0.0,
             max_scroll: 0.0,
-            scroll_to_bottom: false,
-            services_rect: RectF::default(),
+            scroll_custom_to_bottom: false,
             toggle_t: if on { 1.0 } else { 0.0 },
             spin_deg: 0.0,
             anim_timer: false,
-            hits: Vec::with_capacity(24),
+            hits: Vec::with_capacity(28),
             remove_targets: Vec::new(),
             taskbar_msg,
             last_tray_on: on,
@@ -115,6 +132,13 @@ impl UiState {
             edit_focused: false,
             edit_has_text: false,
             notice: None,
+        }
+    }
+
+    fn current_scroll_mut(&mut self) -> &mut f32 {
+        match self.tab {
+            Tab::Steam => &mut self.scroll_steam,
+            Tab::Custom => &mut self.scroll_custom,
         }
     }
 }
@@ -197,9 +221,16 @@ fn host_dot_color(h: Health) -> Color {
     }
 }
 
-fn input_bar_rect(lw: f32) -> RectF {
+fn custom_input_rect(lw: f32) -> RectF {
     let cw = (lw - PAD_X * 2.0).max(200.0);
-    RectF::new(PAD_X, ADD_BAR_Y, (cw - ADD_BTN_W - ADD_GAP).max(100.0), ADD_BAR_H)
+    let inner_x = PAD_X + INPUT_PAD;
+    let inner_w = (cw - INPUT_PAD * 2.0).max(160.0);
+    RectF::new(
+        inner_x,
+        CARD_Y + INPUT_PAD,
+        (inner_w - ADD_BTN_W - ADD_GAP).max(100.0),
+        INPUT_H,
+    )
 }
 
 // ---------------- Pure UI Rendering ----------------
@@ -227,21 +258,42 @@ fn paint_ui(
     let cx = PAD_X;
     let cw = (lw - PAD_X * 2.0).max(200.0);
 
+    // Precompute aggregate stats
+    let steam_rows: Vec<&(String, Stat)> = snap
+        .iter()
+        .filter(|(_, s)| s.group < CUSTOM_GROUP_IDX)
+        .collect();
+    let steam_ok = steam_rows
+        .iter()
+        .filter(|(_, s)| host_health(s, pending) == Health::Ok)
+        .count();
+    let steam_fail = steam_rows
+        .iter()
+        .filter(|(_, s)| host_health(s, pending) == Health::Fail)
+        .count();
+
+    let total_ok = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Ok).count();
+    let total_fail = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Fail).count();
+    let dns_fixed_total = snap
+        .iter()
+        .filter(|(_, s)| matches!(s.dns, DnsState::Poisoned | DnsState::Failed))
+        .count();
+
     // 1. Hero Control Card
-    let hero = RectF::new(cx, 14.0, cw, 76.0);
+    let hero = RectF::new(cx, HERO_Y, cw, HERO_H);
     c.fill_round_rect(hero, R_CARD, SURFACE);
     if state.toggle_t > 0.01 {
-        c.fill_round_rect(hero, R_CARD, SUCCESS.with_alpha((12.0 * state.toggle_t) as u8));
+        c.fill_round_rect(hero, R_CARD, SUCCESS.with_alpha((10.0 * state.toggle_t) as u8));
     }
     let hero_border = if on {
-        Color::lerp(BORDER, SUCCESS, 0.25)
+        Color::lerp(BORDER, SUCCESS, 0.24)
     } else {
         BORDER
     };
     c.stroke_round_rect(hero, R_CARD, 1.0, hero_border);
 
     // Logo + live dot
-    let lx = hero.x + 14.0;
+    let lx = hero.x + 16.0;
     let ly = hero.y + 18.0;
     c.draw_logo(lx, ly, 40.0);
     let dot_col = if on { SUCCESS } else { NEUTRAL };
@@ -251,7 +303,7 @@ fn paint_ui(
     // Toggle switch (right)
     let sw_w = 48.0;
     let sw_h = 26.0;
-    let sw_x = hero.right() - 14.0 - sw_w;
+    let sw_x = hero.right() - 16.0 - sw_w;
     let sw_y = hero.cy() - sw_h * 0.5;
     let sw_rect = RectF::new(sw_x, sw_y, sw_w, sw_h);
     let sw_hovered = state.hover == Some(Action::ToggleBypass);
@@ -266,11 +318,11 @@ fn paint_ui(
 
     // Hero title + inline pill + subtitle
     let tx = lx + 54.0;
-    let max_tx = sw_x - 12.0;
+    let max_tx = sw_x - 14.0;
     let (title_w, _) = c.measure_text(APP_TITLE, state.fonts.title);
     c.draw_text(
         APP_TITLE,
-        RectF::new(tx, hero.y + 17.0, (max_tx - tx).max(40.0), 22.0),
+        RectF::new(tx, hero.y + 16.0, (max_tx - tx).max(40.0), 22.0),
         state.fonts.title,
         TEXT,
         DT_LEFT,
@@ -282,16 +334,8 @@ fn paint_ui(
         } else {
             ("Đã tắt", TEXT_MUTED, NEUTRAL.with_alpha(36), NEUTRAL)
         };
-        c.draw_pill(pill_x, hero.y + 28.0, plabel, pfg, pbg, Some(pdot), state.fonts.badge, false);
+        c.draw_pill(pill_x, hero.y + 27.0, plabel, pfg, pbg, Some(pdot), state.fonts.badge, false);
     }
-
-    let ok_total = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Ok).count();
-    let fail_total = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Fail).count();
-    let dns_fixed_total = snap
-        .iter()
-        .filter(|(_, s)| matches!(s.dns, DnsState::Poisoned | DnsState::Failed))
-        .count();
-    let conns_total: u32 = snap.iter().map(|(_, s)| s.ok).sum();
 
     let (hero_sub, hero_sub_col) = if let Some((msg, col)) = &state.notice {
         (msg.clone(), *col)
@@ -299,20 +343,21 @@ fn paint_ui(
         ("Đang kiểm tra kết nối tới các máy chủ…".to_string(), TEXT_MUTED)
     } else if !on {
         ("Đang kết nối trực tiếp · Không dùng proxy".to_string(), TEXT_MUTED)
-    } else if fail_total > 0 {
-        (format!("{ok_total}/{} tên miền hoạt động · {fail_total} lỗi", snap.len()), TEXT_MUTED)
-    } else if ok_total > 0 && dns_fixed_total > 0 {
+    } else if total_fail > 0 {
         (
-            format!("{ok_total}/{} tên miền hoạt động · {dns_fixed_total} DNS đã sửa", snap.len()),
+            format!("{total_ok}/{} hoạt động · {total_fail} lỗi · 127.0.0.1:{PORT}", snap.len()),
             TEXT_MUTED,
         )
-    } else if ok_total > 0 {
+    } else if total_ok > 0 && dns_fixed_total > 0 {
         (
-            format!("{ok_total}/{} tên miền hoạt động · DoH & chia gói TLS", snap.len()),
+            format!("{total_ok}/{} hoạt động · {dns_fixed_total} DNS sửa · DoH 1.1.1.1", snap.len()),
             TEXT_MUTED,
         )
     } else {
-        ("Proxy cục bộ đang sẵn sàng · Chờ kết nối".to_string(), TEXT_MUTED)
+        (
+            format!("127.0.0.1:{PORT} · DoH 1.1.1.1 · Chia gói TLS"),
+            TEXT_MUTED,
+        )
     };
     c.draw_text(
         &hero_sub,
@@ -322,56 +367,57 @@ fn paint_ui(
         DT_LEFT,
     );
 
-    // 2. Action & Summary Bar
-    let bar_y = 100.0;
-    let bar_h = 30.0;
-    let bar_cy = bar_y + bar_h * 0.5;
-    let sec_title = "Dịch vụ & tên miền";
-    let (sec_w, _) = c.measure_text(sec_title, state.fonts.group);
-    c.draw_text(
-        sec_title,
-        RectF::new(cx, bar_y, sec_w + 4.0, bar_h),
-        state.fonts.group,
-        TEXT_SEC,
-        DT_LEFT,
-    );
+    // 2. Segmented Tab Bar (Left) + "Kiểm tra" Button (Right)
+    let btn_w = 104.0;
+    let seg_w = (cw - btn_w - 12.0).clamp(210.0, 290.0);
+    let seg_rect = RectF::new(cx, NAV_Y, seg_w, NAV_H);
+    c.fill_round_rect(seg_rect, R_BTN, SURFACE);
+    c.stroke_round_rect(seg_rect, R_BTN, 1.0, BORDER);
 
-    let sum_col = if pending > 0 {
-        ACCENT
-    } else if fail_total > 0 && ok_total == 0 {
+    let pad = 3.0;
+    let half_w = (seg_w - pad * 2.0 - 2.0) * 0.5;
+    let tab_h = NAV_H - pad * 2.0;
+    let tab_steam_r = RectF::new(seg_rect.x + pad, seg_rect.y + pad, half_w, tab_h);
+    let tab_custom_r = RectF::new(tab_steam_r.right() + 2.0, seg_rect.y + pad, half_w, tab_h);
+
+    let steam_cnt = format!("{steam_ok}/{}", steam_rows.len());
+    let steam_cnt_col = if steam_fail > 0 && steam_ok == 0 {
         DANGER
-    } else if fail_total > 0 {
+    } else if steam_fail > 0 {
         WARNING
-    } else if ok_total > 0 {
+    } else if steam_ok > 0 {
         SUCCESS
     } else {
         TEXT_DIM
     };
-    let frac = format!("{ok_total}/{}", snap.len());
-    let (frac_w, _) = c.measure_text(&frac, state.fonts.mono);
-    let sum_x = cx + sec_w + 10.0;
-    c.draw_text(
-        &frac,
-        RectF::new(sum_x, bar_y, frac_w + 4.0, bar_h),
-        state.fonts.mono,
-        sum_col,
-        DT_LEFT,
+    draw_tab(
+        &mut c,
+        &state.fonts,
+        tab_steam_r,
+        "Steam",
+        &steam_cnt,
+        steam_cnt_col,
+        state.tab == Tab::Steam,
+        state.hover == Some(Action::SelectTab(Tab::Steam)),
     );
-    if conns_total > 0 {
-        let conn_str = format!("· {conns_total} lượt");
-        c.draw_text(
-            &conn_str,
-            RectF::new(sum_x + frac_w + 4.0, bar_y, 90.0, bar_h),
-            state.fonts.caption,
-            TEXT_DIM,
-            DT_LEFT,
-        );
-    }
+    state.hits.push((tab_steam_r, Action::SelectTab(Tab::Steam)));
 
-    // "Kiểm tra" button (right)
-    let btn_w = 104.0;
-    let btn_h = 28.0;
-    let btn = RectF::new(cx + cw - btn_w, bar_cy - btn_h * 0.5, btn_w, btn_h);
+    let custom_cnt = format!("{}", custom_roots.len());
+    let custom_cnt_col = if custom_roots.is_empty() { TEXT_DIM } else { ACCENT_HOVER };
+    draw_tab(
+        &mut c,
+        &state.fonts,
+        tab_custom_r,
+        "Web khác",
+        &custom_cnt,
+        custom_cnt_col,
+        state.tab == Tab::Custom,
+        state.hover == Some(Action::SelectTab(Tab::Custom)),
+    );
+    state.hits.push((tab_custom_r, Action::SelectTab(Tab::Custom)));
+
+    // "Kiểm tra" button (right, exact same height as segmented bar)
+    let btn = RectF::new(cx + cw - btn_w, NAV_Y, btn_w, NAV_H);
     let btn_hov = pending == 0 && state.hover == Some(Action::RunTest);
     let btn_fill = if pending > 0 {
         SURFACE_INSET
@@ -380,7 +426,7 @@ fn paint_ui(
     } else {
         BTN_BG
     };
-    let btn_border = if btn_hov { ACCENT.with_alpha(130) } else { BORDER };
+    let btn_border = if btn_hov { ACCENT.with_alpha(140) } else { BORDER };
     c.fill_round_rect(btn, R_BTN, btn_fill);
     c.stroke_round_rect(btn, R_BTN, 1.0, btn_border);
 
@@ -413,65 +459,126 @@ fn paint_ui(
         DT_LEFT,
     );
 
-    // 3. Add Custom Domain Bar
-    let inp = input_bar_rect(lw);
-    let inp_hov = state.hover == Some(Action::FocusInput);
-    let inp_border = if state.edit_focused {
-        ACCENT
-    } else if inp_hov {
-        Color::lerp(BORDER, ACCENT, 0.45)
-    } else {
-        BORDER
-    };
-    c.fill_round_rect(inp, R_BTN, SURFACE_INSET);
-    c.stroke_round_rect(inp, R_BTN, if state.edit_focused { 1.4 } else { 1.0 }, inp_border);
-    if !state.edit_focused && !state.edit_has_text {
-        c.draw_text(
-            "Thêm tên miền web khác (vd: reddit.com, x.com)…",
-            RectF::new(inp.x + 11.0, inp.y, (inp.w - 20.0).max(40.0), inp.h),
-            state.fonts.caption,
-            TEXT_DIM,
-            DT_LEFT,
-        );
-    }
-    state.hits.push((inp, Action::FocusInput));
-
-    let add_btn = RectF::new(inp.right() + ADD_GAP, ADD_BAR_Y, ADD_BTN_W, ADD_BAR_H);
-    let add_hov = state.hover == Some(Action::AddDomain);
-    c.fill_round_rect(add_btn, R_BTN, if add_hov { ACCENT_HOVER } else { ACCENT });
-    let add_label = "Thêm";
-    let (alw, _) = c.measure_text(add_label, state.fonts.badge);
-    let plus_w = 10.0;
-    let add_gap = 6.0;
-    let add_sx = add_btn.x + ((add_btn.w - (plus_w + add_gap + alw)) * 0.5).max(8.0);
-    c.draw_plus(add_sx + plus_w * 0.5, add_btn.cy(), 4.2, 1.7, WHITE);
-    c.draw_text(
-        add_label,
-        RectF::new(add_sx + plus_w + add_gap, add_btn.y, alw + 4.0, add_btn.h),
-        state.fonts.badge,
-        WHITE,
-        DT_LEFT,
-    );
-    state.hits.push((add_btn, Action::AddDomain));
-
-    // 4. Services & Custom Domains Accordion Card
-    let card_y = 182.0;
-    let card_h = (lh - 64.0 - card_y).max(120.0);
-    let card = RectF::new(cx, card_y, cw, card_h);
+    // 3. Main Content Card
+    let card_h = (lh - FOOTER_RESERVE - CARD_Y).max(160.0);
+    let card = RectF::new(cx, CARD_Y, cw, card_h);
     c.fill_round_rect(card, R_CARD, SURFACE);
     c.stroke_round_rect(card, R_CARD, 1.0, BORDER);
 
-    let inner = RectF::new(card.x + 1.0, card.y + 4.0, card.w - 2.0, card.h - 8.0);
-    state.services_rect = inner;
+    match state.tab {
+        Tab::Steam => paint_steam_tab(&mut c, card, state, snap, pending),
+        Tab::Custom => paint_custom_tab(&mut c, lw, card, state, snap, custom_roots, pending),
+    }
 
-    let visible_groups: Vec<(usize, Vec<&(String, Stat)>)> = (0..GROUPS.len())
+    // 4. Clean Single-Line Footer
+    let foot_y = lh - 36.0;
+    let foot_h = 24.0;
+    let foot_cy = foot_y + foot_h * 0.5;
+
+    let auto_hov = state.hover == Some(Action::ToggleAutostart);
+    let cb_sz = 15.0;
+    let cb_rect = RectF::new(cx, foot_cy - cb_sz * 0.5, cb_sz, cb_sz);
+    if state.autostart {
+        c.fill_round_rect(cb_rect, 4.0, if auto_hov { ACCENT_HOVER } else { ACCENT });
+        c.draw_checkmark(cb_rect.x + cb_sz * 0.5, cb_rect.cy(), 8.5, 1.8, WHITE);
+    } else {
+        c.fill_round_rect(cb_rect, 4.0, if auto_hov { SURFACE_HOVER } else { SURFACE_INSET });
+        c.stroke_round_rect(cb_rect, 4.0, 1.1, if auto_hov { ACCENT } else { BORDER });
+    }
+    let auto_lbl = "Khởi chạy cùng Windows";
+    let (auto_w, _) = c.measure_text(auto_lbl, state.fonts.caption);
+    c.draw_text(
+        auto_lbl,
+        RectF::new(cx + cb_sz + 8.0, foot_y, auto_w + 6.0, foot_h),
+        state.fonts.caption,
+        if auto_hov || state.autostart { TEXT_SEC } else { TEXT_MUTED },
+        DT_LEFT,
+    );
+    state.hits.push((
+        RectF::new(cx - 2.0, foot_y - 1.0, cb_sz + 8.0 + auto_w + 6.0, foot_h + 2.0),
+        Action::ToggleAutostart,
+    ));
+
+    let quit_w = 50.0;
+    let quit_h = 24.0;
+    let quit_rect = RectF::new(cx + cw - quit_w, foot_y, quit_w, quit_h);
+    let quit_hov = state.hover == Some(Action::QuitApp);
+    if quit_hov {
+        c.fill_round_rect(quit_rect, R_SM, DANGER.with_alpha(30));
+    }
+    c.draw_text(
+        "Thoát",
+        quit_rect,
+        state.fonts.caption,
+        if quit_hov { DANGER } else { TEXT_MUTED },
+        DT_CENTER,
+    );
+    state.hits.push((quit_rect, Action::QuitApp));
+
+    let hint = "Đóng (×) ẩn khay";
+    let (hint_w, _) = c.measure_text(hint, state.fonts.caption);
+    c.draw_text(
+        hint,
+        RectF::new(quit_rect.x - hint_w - 10.0, foot_y, hint_w + 4.0, foot_h),
+        state.fonts.caption,
+        TEXT_DIM,
+        DT_RIGHT,
+    );
+}
+
+fn draw_tab(
+    c: &mut Canvas,
+    fonts: &FontSet,
+    r: RectF,
+    label: &str,
+    count: &str,
+    count_col: Color,
+    active: bool,
+    hovered: bool,
+) {
+    if active {
+        c.fill_round_rect(r, R_SM, SURFACE_ELEV);
+        c.stroke_round_rect(r, R_SM, 1.0, BORDER);
+    } else if hovered {
+        c.fill_round_rect(r, R_SM, SURFACE_HOVER);
+    }
+    let (lw, _) = c.measure_text(label, fonts.badge);
+    let (cw, _) = c.measure_text(count, fonts.mono);
+    let gap = 6.0;
+    let total = lw + gap + cw;
+    let sx = r.x + ((r.w - total) * 0.5).max(6.0);
+    c.draw_text(
+        label,
+        RectF::new(sx, r.y, lw + 4.0, r.h),
+        fonts.badge,
+        if active { TEXT } else if hovered { TEXT_SEC } else { TEXT_MUTED },
+        DT_LEFT,
+    );
+    c.draw_text(
+        count,
+        RectF::new(sx + lw + gap, r.y, cw + 4.0, r.h),
+        fonts.mono,
+        count_col,
+        DT_LEFT,
+    );
+}
+
+fn paint_steam_tab(
+    c: &mut Canvas,
+    card: RectF,
+    state: &mut UiState,
+    snap: &[(String, Stat)],
+    pending: usize,
+) {
+    let inner = RectF::new(card.x + 1.0, card.y + 6.0, card.w - 2.0, card.h - 12.0);
+    let visible_groups: Vec<(usize, Vec<&(String, Stat)>)> = (0..CUSTOM_GROUP_IDX)
         .filter_map(|gi| {
             let rows: Vec<&(String, Stat)> = snap.iter().filter(|(_, s)| s.group == gi).collect();
             if rows.is_empty() { None } else { Some((gi, rows)) }
         })
         .collect();
 
-    const GROUP_H: f32 = 56.0;
+    const GROUP_H: f32 = 58.0;
     const HOST_H: f32 = 34.0;
     let content_h: f32 = visible_groups
         .iter()
@@ -480,17 +587,12 @@ fn paint_ui(
         })
         .sum();
     state.max_scroll = (content_h - inner.h).max(0.0);
-    if state.scroll_to_bottom {
-        state.scroll_y = state.max_scroll;
-        state.scroll_to_bottom = false;
-    } else {
-        state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll);
-    }
+    state.scroll_steam = state.scroll_steam.clamp(0.0, state.max_scroll);
 
     let scroll_pad = if state.max_scroll > 0.5 { 8.0 } else { 0.0 };
     c.set_clip(Some(inner));
 
-    let mut y = inner.y - state.scroll_y;
+    let mut y = inner.y - state.scroll_steam;
     for (idx, (gi, rows)) in visible_groups.iter().enumerate() {
         let gh_rect = RectF::new(inner.x, y, inner.w, GROUP_H);
         if idx > 0 && y >= inner.y - 2.0 && y <= inner.bottom() + 2.0 {
@@ -527,15 +629,14 @@ fn paint_ui(
             let (gh, ok_c, _fail_c, dns_fixed) = group_health(rows, pending);
             let dot_c = host_dot_color(gh);
             let gcy = y + GROUP_H * 0.5;
-            let gx = inner.x + 14.0;
+            let gx = inner.x + 16.0;
 
             c.draw_chevron(gx + 4.0, gcy, 3.5, is_exp, TEXT_MUTED);
             if gh == Health::Ok {
-                c.fill_circle(gx + 20.0, gcy, 7.0, SUCCESS.with_alpha(38));
+                c.fill_circle(gx + 20.0, gcy, 7.0, SUCCESS.with_alpha(36));
             }
             c.fill_circle(gx + 20.0, gcy, 4.0, dot_c);
 
-            // Right pill + count
             let (blabel, bfg, bbg) = health_badge(gh);
             let pill_rect = c.draw_pill(
                 inner.right() - 14.0 - scroll_pad,
@@ -557,13 +658,12 @@ fn paint_ui(
                 DT_RIGHT,
             );
 
-            // Left title + desc
             let text_left = gx + 34.0;
             let text_right = (pill_rect.x - fw - 18.0).max(text_left + 40.0);
             let (gname, gdesc) = GROUPS[*gi];
             c.draw_text(
                 gname,
-                RectF::new(text_left, y + 9.0, text_right - text_left, 20.0),
+                RectF::new(text_left, y + 10.0, text_right - text_left, 20.0),
                 state.fonts.group,
                 TEXT,
                 DT_LEFT,
@@ -575,7 +675,7 @@ fn paint_ui(
             };
             c.draw_text(
                 &sub,
-                RectF::new(text_left, y + 29.0, text_right - text_left, 17.0),
+                RectF::new(text_left, y + 30.0, text_right - text_left, 17.0),
                 state.fonts.caption,
                 TEXT_MUTED,
                 DT_LEFT,
@@ -595,9 +695,9 @@ fn paint_ui(
                 if hr.bottom() > inner.y && hr.y < inner.bottom() {
                     if hi > 0 {
                         c.draw_line(
-                            inner.x + 24.0,
+                            inner.x + 26.0,
                             y,
-                            inner.right() - 10.0 - scroll_pad,
+                            inner.right() - 12.0 - scroll_pad,
                             y,
                             1.0,
                             BORDER_SUB,
@@ -606,40 +706,9 @@ fn paint_ui(
                     }
                     let hcy = y + HOST_H * 0.5;
                     let hh = host_health(s, pending);
-                    c.fill_circle(inner.x + 24.0, hcy, 3.0, host_dot_color(hh));
+                    c.fill_circle(inner.x + 26.0, hcy, 3.0, host_dot_color(hh));
 
-                    let mut rx = inner.right() - 10.0 - scroll_pad;
-
-                    // Delete button for user-added custom root domains
-                    let removable = *gi == CUSTOM_GROUP_IDX
-                        && custom_roots.iter().any(|d| d.eq_ignore_ascii_case(host));
-                    if removable {
-                        let del_idx = state.remove_targets.len();
-                        state.remove_targets.push((*host).clone());
-                        let del_sz = 20.0;
-                        let del_r = RectF::new(rx - del_sz, hcy - del_sz * 0.5, del_sz, del_sz);
-                        let del_hov = state.hover == Some(Action::RemoveDomain(del_idx));
-                        if del_hov {
-                            c.fill_round_rect(del_r, 5.0, DANGER.with_alpha(38));
-                        }
-                        c.draw_cross(
-                            del_r.x + del_sz * 0.5,
-                            del_r.cy(),
-                            3.6,
-                            1.5,
-                            if del_hov { DANGER } else { TEXT_DIM },
-                        );
-                        let ht = del_r.y.max(inner.y);
-                        let hb = del_r.bottom().min(inner.bottom());
-                        if hb > ht {
-                            state.hits.push((
-                                RectF::new(del_r.x, ht, del_r.w, hb - ht),
-                                Action::RemoveDomain(del_idx),
-                            ));
-                        }
-                        rx -= del_sz + 6.0;
-                    }
-
+                    let mut rx = inner.right() - 12.0 - scroll_pad;
                     if s.ok > 0 {
                         let cnt = format!("×{}", s.ok);
                         let (cw_txt, _) = c.measure_text(&cnt, state.fonts.caption);
@@ -662,7 +731,7 @@ fn paint_ui(
                         TEXT_MUTED,
                         DT_RIGHT,
                     );
-                    rx -= ip_w + 7.0;
+                    rx -= ip_w + 8.0;
 
                     match s.dns {
                         DnsState::Poisoned | DnsState::Failed => {
@@ -675,7 +744,7 @@ fn paint_ui(
                                 WARNING,
                                 DT_RIGHT,
                             );
-                            rx -= tw + 7.0;
+                            rx -= tw + 8.0;
                         }
                         DnsState::Clean => {
                             let tag = "DNS OK";
@@ -687,15 +756,15 @@ fn paint_ui(
                                 TEXT_DIM,
                                 DT_RIGHT,
                             );
-                            rx -= tw + 7.0;
+                            rx -= tw + 8.0;
                         }
                         DnsState::Unknown => {}
                     }
 
-                    let host_left = inner.x + 35.0;
+                    let host_left = inner.x + 38.0;
                     c.draw_text(
                         host,
-                        RectF::new(host_left, y, (rx - host_left - 4.0).max(40.0), HOST_H),
+                        RectF::new(host_left, y, (rx - host_left - 6.0).max(40.0), HOST_H),
                         state.fonts.body,
                         TEXT_SEC,
                         DT_LEFT,
@@ -706,98 +775,281 @@ fn paint_ui(
         }
     }
 
-    // Slim scrollbar thumb
-    if state.max_scroll > 0.5 && content_h > inner.h {
-        let track_h = (inner.h - 8.0).max(20.0);
-        let thumb_h = ((inner.h / content_h) * track_h).clamp(24.0, track_h);
-        let ratio = state.scroll_y / state.max_scroll;
-        let thumb_y = inner.y + 4.0 + ratio * (track_h - thumb_h);
+    draw_scrollbar(c, inner, content_h, state.scroll_steam, state.max_scroll);
+    c.set_clip(None);
+}
+
+fn paint_custom_tab(
+    c: &mut Canvas,
+    lw: f32,
+    card: RectF,
+    state: &mut UiState,
+    snap: &[(String, Stat)],
+    custom_roots: &[String],
+    pending: usize,
+) {
+    // Top fixed input bar inside card
+    let inp = custom_input_rect(lw);
+    let inp_hov = state.hover == Some(Action::FocusInput);
+    let inp_border = if state.edit_focused {
+        ACCENT
+    } else if inp_hov {
+        Color::lerp(BORDER, ACCENT, 0.45)
+    } else {
+        BORDER
+    };
+    c.fill_round_rect(inp, R_BTN, SURFACE_INSET);
+    c.stroke_round_rect(inp, R_BTN, if state.edit_focused { 1.4 } else { 1.0 }, inp_border);
+    if !state.edit_focused && !state.edit_has_text {
+        c.draw_text(
+            "Nhập tên miền (vd: bbc.com, medium.com, reddit.com)…",
+            RectF::new(inp.x + 11.0, inp.y, (inp.w - 20.0).max(40.0), inp.h),
+            state.fonts.caption,
+            TEXT_DIM,
+            DT_LEFT,
+        );
+    }
+    state.hits.push((inp, Action::FocusInput));
+
+    let add_btn = RectF::new(inp.right() + ADD_GAP, inp.y, ADD_BTN_W, INPUT_H);
+    let add_hov = state.hover == Some(Action::AddDomain);
+    c.fill_round_rect(add_btn, R_BTN, if add_hov { ACCENT_HOVER } else { ACCENT });
+    let add_label = "Thêm";
+    let (alw, _) = c.measure_text(add_label, state.fonts.badge);
+    let plus_w = 10.0;
+    let add_gap = 6.0;
+    let add_sx = add_btn.x + ((add_btn.w - (plus_w + add_gap + alw)) * 0.5).max(8.0);
+    c.draw_plus(add_sx + plus_w * 0.5, add_btn.cy(), 4.2, 1.7, WHITE);
+    c.draw_text(
+        add_label,
+        RectF::new(add_sx + plus_w + add_gap, add_btn.y, alw + 4.0, add_btn.h),
+        state.fonts.badge,
+        WHITE,
+        DT_LEFT,
+    );
+    state.hits.push((add_btn, Action::AddDomain));
+
+    let div_y = inp.bottom() + INPUT_PAD;
+    c.draw_line(card.x + 1.0, div_y, card.right() - 1.0, div_y, 1.0, BORDER_SUB, false);
+
+    // Bottom fixed informational note inside card
+    let info_h = 28.0;
+    let info_y = card.bottom() - info_h - 1.0;
+    c.draw_line(card.x + 1.0, info_y, card.right() - 1.0, info_y, 1.0, BORDER_SUB, false);
+    c.draw_text(
+        "Chỉ vượt chặn DNS/DPI nhà mạng · Web tự chặn IP (403/WAF) cần VPN",
+        RectF::new(card.x + 12.0, info_y, card.w - 24.0, info_h),
+        state.fonts.caption,
+        TEXT_DIM,
+        DT_CENTER,
+    );
+
+    // Scrollable custom domains list
+    let list_r = RectF::new(
+        card.x + 1.0,
+        div_y + 1.0,
+        card.w - 2.0,
+        (info_y - div_y - 2.0).max(40.0),
+    );
+
+    if custom_roots.is_empty() {
+        state.max_scroll = 0.0;
+        state.scroll_custom = 0.0;
+        let mid_x = list_r.x + list_r.w * 0.5;
+        let mid_y = list_r.cy() - 4.0;
+        c.fill_circle(mid_x, mid_y - 24.0, 18.0, SURFACE_INSET);
+        c.stroke_circle(mid_x, mid_y - 24.0, 18.0, 1.0, BORDER);
+        c.draw_plus(mid_x, mid_y - 24.0, 6.0, 1.8, TEXT_MUTED);
+        c.draw_text(
+            "Chưa có tên miền tùy chỉnh",
+            RectF::new(list_r.x + 16.0, mid_y + 2.0, list_r.w - 32.0, 20.0),
+            state.fonts.group,
+            TEXT_SEC,
+            DT_CENTER,
+        );
+        c.draw_text(
+            "Dán tên miền hoặc đường dẫn ở trên rồi nhấn Enter hoặc + Thêm",
+            RectF::new(list_r.x + 16.0, mid_y + 24.0, list_r.w - 32.0, 18.0),
+            state.fonts.caption,
+            TEXT_MUTED,
+            DT_CENTER,
+        );
+        return;
+    }
+
+    const ROW_H: f32 = 54.0;
+    let content_h = custom_roots.len() as f32 * ROW_H;
+    state.max_scroll = (content_h - list_r.h).max(0.0);
+    if state.scroll_custom_to_bottom {
+        state.scroll_custom = state.max_scroll;
+        state.scroll_custom_to_bottom = false;
+    } else {
+        state.scroll_custom = state.scroll_custom.clamp(0.0, state.max_scroll);
+    }
+
+    let scroll_pad = if state.max_scroll > 0.5 { 8.0 } else { 0.0 };
+    c.set_clip(Some(list_r));
+
+    let mut y = list_r.y - state.scroll_custom;
+    for (idx, root) in custom_roots.iter().enumerate() {
+        let rr = RectF::new(list_r.x, y, list_r.w, ROW_H);
+        if idx > 0 && y >= list_r.y - 2.0 && y <= list_r.bottom() + 2.0 {
+            c.draw_line(
+                list_r.x + 14.0,
+                y,
+                list_r.right() - 14.0 - scroll_pad,
+                y,
+                1.0,
+                BORDER_SUB,
+                false,
+            );
+        }
+
+        if rr.bottom() > list_r.y && rr.y < list_r.bottom() {
+            // Aggregate live traffic across root + any *.root subdomains
+            let exact = snap.iter().find(|(h, _)| h.eq_ignore_ascii_case(root)).map(|(_, s)| s);
+            let mut total_hits: u32 = 0;
+            let mut any_ok = false;
+            let mut any_fail = false;
+            let mut best_ip = String::new();
+            let mut best_dns = DnsState::Unknown;
+
+            if let Some(s) = exact {
+                best_ip = s.ip.clone();
+                best_dns = s.dns;
+            }
+            for (h, s) in snap {
+                if domain_matches(&h.to_ascii_lowercase(), root) {
+                    total_hits += s.ok;
+                    if host_health(s, pending) == Health::Ok {
+                        any_ok = true;
+                    } else if host_health(s, pending) == Health::Fail {
+                        any_fail = true;
+                    }
+                    if best_ip.is_empty() && !s.ip.is_empty() {
+                        best_ip = s.ip.clone();
+                    }
+                    if matches!(s.dns, DnsState::Poisoned | DnsState::Failed) {
+                        best_dns = s.dns;
+                    }
+                }
+            }
+
+            let h = if any_ok {
+                Health::Ok
+            } else if any_fail {
+                Health::Fail
+            } else if pending > 0 {
+                Health::Testing
+            } else {
+                Health::Idle
+            };
+
+            let rcy = y + ROW_H * 0.5;
+            let dot_x = list_r.x + 20.0;
+            if h == Health::Ok {
+                c.fill_circle(dot_x, rcy, 7.0, SUCCESS.with_alpha(36));
+            }
+            c.fill_circle(dot_x, rcy, 4.0, host_dot_color(h));
+
+            // Right-most delete button
+            let del_idx = state.remove_targets.len();
+            state.remove_targets.push(root.clone());
+            let del_sz = 24.0;
+            let del_r = RectF::new(
+                list_r.right() - 12.0 - scroll_pad - del_sz,
+                rcy - del_sz * 0.5,
+                del_sz,
+                del_sz,
+            );
+            let del_hov = state.hover == Some(Action::RemoveDomain(del_idx));
+            if del_hov {
+                c.fill_round_rect(del_r, R_SM, DANGER.with_alpha(36));
+            }
+            c.draw_cross(
+                del_r.x + del_sz * 0.5,
+                del_r.cy(),
+                3.8,
+                1.6,
+                if del_hov { DANGER } else { TEXT_DIM },
+            );
+            let ht = del_r.y.max(list_r.y);
+            let hb = del_r.bottom().min(list_r.bottom());
+            if hb > ht {
+                state.hits.push((
+                    RectF::new(del_r.x, ht, del_r.w, hb - ht),
+                    Action::RemoveDomain(del_idx),
+                ));
+            }
+
+            // Status pill left of delete button
+            let (blabel, bfg, bbg) = health_badge(h);
+            let pill_r = c.draw_pill(
+                del_r.x - 8.0,
+                rcy,
+                blabel,
+                bfg,
+                bbg,
+                None,
+                state.fonts.badge,
+                true,
+            );
+
+            // Domain title + metadata sub-line
+            let text_left = dot_x + 14.0;
+            let text_w = (pill_r.x - 10.0 - text_left).max(60.0);
+            c.draw_text(
+                root,
+                RectF::new(text_left, y + 9.0, text_w, 19.0),
+                state.fonts.group,
+                TEXT,
+                DT_LEFT,
+            );
+
+            let ip_txt = if best_ip.is_empty() { "Đang phân giải…".to_string() } else { best_ip };
+            let dns_txt = match best_dns {
+                DnsState::Poisoned | DnsState::Failed => " · DNS đã sửa",
+                DnsState::Clean => " · DNS OK",
+                DnsState::Unknown => "",
+            };
+            let hit_txt = if total_hits > 0 {
+                format!(" · ×{total_hits}")
+            } else {
+                String::new()
+            };
+            let meta = format!("{ip_txt}{dns_txt}{hit_txt}");
+            let meta_col = if matches!(best_dns, DnsState::Poisoned | DnsState::Failed) {
+                WARNING
+            } else {
+                TEXT_MUTED
+            };
+            c.draw_text(
+                &meta,
+                RectF::new(text_left, y + 29.0, text_w, 16.0),
+                state.fonts.caption,
+                meta_col,
+                DT_LEFT,
+            );
+        }
+        y += ROW_H;
+    }
+
+    draw_scrollbar(c, list_r, content_h, state.scroll_custom, state.max_scroll);
+    c.set_clip(None);
+}
+
+fn draw_scrollbar(c: &mut Canvas, area: RectF, content_h: f32, scroll_y: f32, max_scroll: f32) {
+    if max_scroll > 0.5 && content_h > area.h {
+        let track_h = (area.h - 8.0).max(20.0);
+        let thumb_h = ((area.h / content_h) * track_h).clamp(24.0, track_h);
+        let ratio = scroll_y / max_scroll;
+        let thumb_y = area.y + 4.0 + ratio * (track_h - thumb_h);
         c.fill_round_rect(
-            RectF::new(inner.right() - 7.0, thumb_y, 4.0, thumb_h),
+            RectF::new(area.right() - 7.0, thumb_y, 4.0, thumb_h),
             2.0,
             WHITE.with_alpha(52),
         );
     }
-
-    c.set_clip(None);
-
-    // 5. Footer Row 1: Autostart checkbox + Tray hint
-    let row1_y = lh - 56.0;
-    let row1_h = 22.0;
-    let row1_cy = row1_y + row1_h * 0.5;
-
-    let auto_hov = state.hover == Some(Action::ToggleAutostart);
-    let cb_sz = 15.0;
-    let cb_rect = RectF::new(cx, row1_cy - cb_sz * 0.5, cb_sz, cb_sz);
-    if state.autostart {
-        c.fill_round_rect(cb_rect, 4.0, if auto_hov { ACCENT_HOVER } else { ACCENT });
-        c.draw_checkmark(cb_rect.x + cb_sz * 0.5, cb_rect.cy(), 8.5, 1.8, WHITE);
-    } else {
-        c.fill_round_rect(cb_rect, 4.0, if auto_hov { SURFACE_HOVER } else { SURFACE_INSET });
-        c.stroke_round_rect(
-            cb_rect,
-            4.0,
-            1.1,
-            if auto_hov { ACCENT } else { BORDER },
-        );
-    }
-    let auto_lbl = "Khởi chạy cùng Windows";
-    let (auto_w, _) = c.measure_text(auto_lbl, state.fonts.caption);
-    c.draw_text(
-        auto_lbl,
-        RectF::new(cx + cb_sz + 8.0, row1_y, auto_w + 6.0, row1_h),
-        state.fonts.caption,
-        if auto_hov || state.autostart { TEXT_SEC } else { TEXT_MUTED },
-        DT_LEFT,
-    );
-    state.hits.push((
-        RectF::new(cx - 2.0, row1_y - 1.0, cb_sz + 8.0 + auto_w + 6.0, row1_h + 2.0),
-        Action::ToggleAutostart,
-    ));
-
-    let hint = "Đóng (×) để chạy nền";
-    let (hint_w, _) = c.measure_text(hint, state.fonts.caption);
-    c.draw_text(
-        hint,
-        RectF::new(cx + cw - hint_w - 2.0, row1_y, hint_w + 4.0, row1_h),
-        state.fonts.caption,
-        TEXT_DIM,
-        DT_RIGHT,
-    );
-
-    // 6. Footer Row 2: Proxy info + Quit
-    let row2_y = lh - 30.0;
-    let row2_h = 22.0;
-    let quit_w = 50.0;
-    let quit_h = 22.0;
-    let quit_rect = RectF::new(cx + cw - quit_w, row2_y, quit_w, quit_h);
-    let quit_hov = state.hover == Some(Action::QuitApp);
-    if quit_hov {
-        c.fill_round_rect(quit_rect, R_SM, DANGER.with_alpha(30));
-    }
-    c.draw_text(
-        "Thoát",
-        quit_rect,
-        state.fonts.caption,
-        if quit_hov { DANGER } else { TEXT_MUTED },
-        DT_CENTER,
-    );
-    state.hits.push((quit_rect, Action::QuitApp));
-
-    let custom_n = custom_roots.len();
-    let left_info = if custom_n > 0 {
-        format!("127.0.0.1:{PORT} · DoH 1.1.1.1 · +{custom_n} web tùy chỉnh")
-    } else {
-        format!("127.0.0.1:{PORT} · DoH 1.1.1.1")
-    };
-    let left_max = (quit_rect.x - 10.0 - cx).max(60.0);
-    c.draw_text(
-        &left_info,
-        RectF::new(cx, row2_y, left_max, row2_h),
-        state.fonts.caption,
-        TEXT_DIM,
-        DT_LEFT,
-    );
 }
 
 // ---------------- Win32 Window, Edit Control & Tray ----------------
@@ -815,7 +1067,7 @@ fn layout_edit(hwnd: HWND, state: &UiState) {
         GetClientRect(hwnd, &mut cr);
         let scale = state.dpi as f32 / 96.0;
         let lw = ((cr.right - cr.left).max(1) as f32 / scale).max(320.0);
-        let inp = input_bar_rect(lw);
+        let inp = custom_input_rect(lw);
         let eh = 18.0;
         let px = ((inp.x + 10.0) * scale).round() as i32;
         let py = ((inp.cy() - eh * 0.5) * scale).round() as i32;
@@ -830,6 +1082,28 @@ fn layout_edit(hwnd: HWND, state: &UiState) {
             ph,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+fn sync_edit_visibility(hwnd: HWND, state: &mut UiState) {
+    if state.edit_hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if state.tab == Tab::Custom {
+            layout_edit(hwnd, state);
+            if state.edit_focused || state.edit_has_text {
+                ShowWindow(state.edit_hwnd, SW_SHOW);
+            } else {
+                ShowWindow(state.edit_hwnd, SW_HIDE);
+            }
+        } else {
+            if state.edit_focused {
+                SetFocus(hwnd);
+                state.edit_focused = false;
+            }
+            ShowWindow(state.edit_hwnd, SW_HIDE);
+        }
     }
 }
 
@@ -856,7 +1130,7 @@ fn set_notice(hwnd: HWND, state: &mut UiState, msg: String, color: Color) {
 }
 
 fn focus_domain_input(hwnd: HWND, state: &mut UiState) {
-    if state.edit_hwnd.is_null() {
+    if state.edit_hwnd.is_null() || state.tab != Tab::Custom {
         return;
     }
     layout_edit(hwnd, state);
@@ -871,6 +1145,9 @@ fn submit_domain_input(hwnd: HWND) {
     let Some(state) = get_state(hwnd) else {
         return;
     };
+    if state.tab != Tab::Custom {
+        return;
+    }
     let raw = read_edit_text(state.edit_hwnd);
     if raw.trim().is_empty() {
         focus_domain_input(hwnd, state);
@@ -888,8 +1165,7 @@ fn submit_domain_input(hwnd: HWND) {
                 }
             }
             state.edit_has_text = false;
-            state.expanded[CUSTOM_GROUP_IDX] = true;
-            state.scroll_to_bottom = true;
+            state.scroll_custom_to_bottom = true;
             set_notice(hwnd, state, format!("Đã thêm {domain} · Đang kiểm tra…"), SUCCESS);
             sync_timer(hwnd, state);
         }
@@ -1011,7 +1287,7 @@ fn show_main(hwnd: HWND) {
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
         if let Some(st) = get_state(hwnd) {
-            layout_edit(hwnd, st);
+            sync_edit_visibility(hwnd, st);
         }
         InvalidateRect(hwnd, null(), 0);
     }
@@ -1323,6 +1599,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                                 sync_timer(hwnd, state);
                             }
                         }
+                        Action::SelectTab(tab) => {
+                            if let Some(state) = get_state(hwnd) {
+                                if state.tab != tab {
+                                    state.tab = tab;
+                                    state.hover = None;
+                                    sync_edit_visibility(hwnd, state);
+                                }
+                            }
+                        }
                         Action::RunTest => {
                             proxy::run_test();
                             if let Some(state) = get_state(hwnd) {
@@ -1371,7 +1656,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(state) = get_state(hwnd) {
                     if state.max_scroll > 0.5 {
                         let delta = ((wp >> 16) as u16) as i16 as f32;
-                        state.scroll_y = (state.scroll_y - (delta / 120.0) * 34.0).clamp(0.0, state.max_scroll);
+                        let max_s = state.max_scroll;
+                        let cur = state.current_scroll_mut();
+                        *cur = (*cur - (delta / 120.0) * 34.0).clamp(0.0, max_s);
                         InvalidateRect(hwnd, null(), 0);
                     }
                 }
@@ -1621,40 +1908,22 @@ mod tests {
         }
     }
 
-    fn sample_snap(with_fail: bool, with_custom: bool) -> Vec<(String, Stat)> {
+    fn sample_snap(with_custom: bool) -> Vec<(String, Stat)> {
         let mut v: Vec<(String, Stat)> = vec![
-            ("store.steampowered.com".into(), make_stat(0, 4, 0, "23.15.142.182", DnsState::Poisoned)),
-            (
-                "steamcommunity.com".into(),
-                make_stat(
-                    1,
-                    if with_fail { 0 } else { 3 },
-                    if with_fail { 1 } else { 0 },
-                    "23.210.5.41",
-                    DnsState::Poisoned,
-                ),
-            ),
-            ("api.steampowered.com".into(), make_stat(2, 2, 0, "104.16.120.11", DnsState::Clean)),
-            (
-                "help.steampowered.com".into(),
-                make_stat(
-                    2,
-                    if with_fail { 0 } else { 1 },
-                    if with_fail { 1 } else { 0 },
-                    "23.15.142.182",
-                    DnsState::Clean,
-                ),
-            ),
-            ("login.steampowered.com".into(), make_stat(2, 5, 0, "155.133.248.39", DnsState::Poisoned)),
-            ("steamcommunity-a.akamaihd.net".into(), make_stat(3, 6, 0, "23.200.143.5", DnsState::Clean)),
-            ("steamcdn-a.akamaihd.net".into(), make_stat(3, 2, 0, "23.200.143.11", DnsState::Clean)),
-            ("avatars.akamai.steamstatic.com".into(), make_stat(4, 3, 0, "23.200.143.16", DnsState::Clean)),
-            ("cdn.akamai.steamstatic.com".into(), make_stat(4, 2, 0, "23.200.143.16", DnsState::Clean)),
-            ("cdn.cloudflare.steamstatic.com".into(), make_stat(4, 4, 0, "104.16.124.96", DnsState::Clean)),
+            ("store.steampowered.com".into(), make_stat(0, 4, 0, "23.15.142.182", DnsState::Clean)),
+            ("steamcommunity.com".into(), make_stat(1, 3, 0, "23.15.140.216", DnsState::Clean)),
+            ("api.steampowered.com".into(), make_stat(2, 2, 0, "23.35.148.174", DnsState::Clean)),
+            ("help.steampowered.com".into(), make_stat(2, 1, 0, "184.87.106.51", DnsState::Clean)),
+            ("login.steampowered.com".into(), make_stat(2, 5, 0, "23.35.148.153", DnsState::Clean)),
+            ("steamcommunity-a.akamaihd.net".into(), make_stat(3, 6, 0, "104.84.150.191", DnsState::Clean)),
+            ("steamcdn-a.akamaihd.net".into(), make_stat(3, 2, 0, "23.208.12.168", DnsState::Clean)),
+            ("avatars.akamai.steamstatic.com".into(), make_stat(4, 3, 0, "23.200.230.152", DnsState::Clean)),
+            ("cdn.akamai.steamstatic.com".into(), make_stat(4, 2, 0, "23.200.230.169", DnsState::Clean)),
+            ("cdn.cloudflare.steamstatic.com".into(), make_stat(4, 4, 0, "104.84.150.196", DnsState::Clean)),
         ];
         if with_custom {
-            v.push(("reddit.com".into(), make_stat(CUSTOM_GROUP_IDX, 3, 0, "151.101.1.140", DnsState::Poisoned)));
-            v.push(("medium.com".into(), make_stat(CUSTOM_GROUP_IDX, 1, 0, "162.159.152.4", DnsState::Clean)));
+            v.push(("bbc.com".into(), make_stat(CUSTOM_GROUP_IDX, 3, 0, "151.101.0.81", DnsState::Clean)));
+            v.push(("medium.com".into(), make_stat(CUSTOM_GROUP_IDX, 2, 0, "162.159.152.4", DnsState::Poisoned)));
         }
         v.sort_by(|a, b| a.1.group.cmp(&b.1.group).then(a.0.cmp(&b.0)));
         v
@@ -1663,10 +1932,9 @@ mod tests {
     fn render_bmp(
         path: &str,
         dpi: u32,
+        tab: Tab,
         on: bool,
         autostart: bool,
-        pending: usize,
-        expanded: [bool; GROUPS.len()],
         snap: &[(String, Stat)],
         custom_roots: &[String],
     ) {
@@ -1691,11 +1959,8 @@ mod tests {
             let old = SelectObject(mem_dc, hbmp as HGDIOBJ);
 
             let mut state = UiState::new(dpi, on, autostart, 0);
-            state.expanded = expanded;
-            if expanded[CUSTOM_GROUP_IDX] {
-                state.scroll_to_bottom = true;
-            }
-            paint_ui(mem_dc, pw, ph, &mut state, snap, custom_roots, on, pending);
+            state.tab = tab;
+            paint_ui(mem_dc, pw, ph, &mut state, snap, custom_roots, on, 0);
 
             let src = std::slice::from_raw_parts(bits as *const u8, (pw * ph * 4) as usize);
             let row_stride = ((pw as usize * 3) + 3) & !3;
@@ -1740,29 +2005,36 @@ mod tests {
     #[test]
     fn render_ui_previews() {
         let dir = env!("CARGO_MANIFEST_DIR");
-        let ok_snap = sample_snap(false, false);
-        let custom_snap = sample_snap(false, true);
-        let custom_roots = vec!["reddit.com".to_string(), "medium.com".to_string()];
+        let snap_steam = sample_snap(false);
+        let snap_custom = sample_snap(true);
+        let custom_roots = vec!["bbc.com".to_string(), "medium.com".to_string()];
 
         render_bmp(
-            &format!(r"{dir}\target\preview_compact.bmp"),
+            &format!(r"{dir}\target\preview_tab_steam.bmp"),
             96,
+            Tab::Steam,
             true,
-            false,
-            0,
-            [false; GROUPS.len()],
-            &ok_snap,
-            &[],
+            true,
+            &snap_custom,
+            &custom_roots,
         );
         render_bmp(
-            &format!(r"{dir}\target\preview_custom.bmp"),
+            &format!(r"{dir}\target\preview_tab_custom.bmp"),
             96,
+            Tab::Custom,
             true,
             true,
-            0,
-            [false, false, false, false, false, false, true],
-            &custom_snap,
+            &snap_custom,
             &custom_roots,
+        );
+        render_bmp(
+            &format!(r"{dir}\target\preview_tab_custom_empty.bmp"),
+            96,
+            Tab::Custom,
+            true,
+            false,
+            &snap_steam,
+            &[],
         );
     }
 }

@@ -63,7 +63,7 @@ pub const CATALOG: &[&str] = &[
     "avatars.akamai.steamstatic.com",
 ];
 
-fn domain_matches(host: &str, domain: &str) -> bool {
+pub fn domain_matches(host: &str, domain: &str) -> bool {
     host == domain
         || (host.len() > domain.len()
             && host.ends_with(domain)
@@ -100,7 +100,7 @@ fn group_of(host: &str) -> usize {
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DnsState {
     #[default]
     Unknown,
@@ -128,7 +128,7 @@ static PAC_VERSION: AtomicUsize = AtomicUsize::new(1);
 static UI_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static UI_DIRTY: AtomicBool = AtomicBool::new(false);
 
-type DnsCache = HashMap<String, (IpAddr, Instant)>;
+type DnsCache = HashMap<String, (Vec<IpAddr>, Instant)>;
 static CACHE: Mutex<Option<DnsCache>> = Mutex::new(None);
 static WINHTTP_SESSION: OnceLock<usize> = OnceLock::new();
 
@@ -302,8 +302,10 @@ fn winhttp_session() -> Option<*mut core::ffi::c_void> {
     }
 }
 
-fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Option<IpAddr> {
-    let session = winhttp_session()?;
+fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Vec<IpAddr> {
+    let Some(session) = winhttp_session() else {
+        return Vec::new();
+    };
     let srv_w = wide(server);
     let verb_w = wide("GET");
     let path_w = wide(&format!("{endpoint}?name={host}&type=A"));
@@ -312,7 +314,7 @@ fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Option<IpAddr> 
     unsafe {
         let conn = WinHttpConnect(session, srv_w.as_ptr(), 443, 0);
         if conn.is_null() {
-            return None;
+            return Vec::new();
         }
         let req = WinHttpOpenRequest(
             conn,
@@ -325,7 +327,7 @@ fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Option<IpAddr> 
         );
         if req.is_null() {
             WinHttpCloseHandle(conn);
-            return None;
+            return Vec::new();
         }
 
         WinHttpSetTimeouts(req, 5000, 5000, 5000, 5000);
@@ -349,49 +351,66 @@ fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Option<IpAddr> 
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
 
-        let text = std::str::from_utf8(&body).ok()?;
-        parse_doh_a_record(text)
+        match std::str::from_utf8(&body) {
+            Ok(text) => parse_doh_a_records(text),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
-pub fn resolve_doh(host: &str) -> Option<IpAddr> {
+pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(ip);
+        return vec![ip];
     }
     if host.is_empty()
         || !host
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
     {
-        return None;
+        return Vec::new();
     }
     if let Some(map) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        if let Some((ip, t)) = map.get(host) {
+        if let Some((ips, t)) = map.get(host) {
             if t.elapsed() < Duration::from_secs(300) {
-                return Some(*ip);
+                return ips.clone();
             }
         }
     }
 
-    let ip = query_doh_server("1.1.1.1", "/dns-query", host)
-        .or_else(|| query_doh_server("1.0.0.1", "/dns-query", host))
-        .or_else(|| query_doh_server("8.8.8.8", "/resolve", host))?;
-    CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(host.to_string(), (ip, Instant::now()));
-    Some(ip)
+    let mut ips = query_doh_server("1.1.1.1", "/dns-query", host);
+    if ips.is_empty() {
+        ips = query_doh_server("1.0.0.1", "/dns-query", host);
+    }
+    if ips.is_empty() {
+        ips = query_doh_server("8.8.8.8", "/resolve", host);
+    }
+    if !ips.is_empty() {
+        CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(host.to_string(), (ips.clone(), Instant::now()));
+    }
+    ips
 }
 
-/// Minimal dependency-free parser for Cloudflare DoH DNS-JSON `"Answer"` A records (`type: 1`).
-pub(crate) fn parse_doh_a_record(body: &str) -> Option<IpAddr> {
-    let ans_pos = find_json_key(body, "Answer")?;
+pub fn resolve_doh(host: &str) -> Option<IpAddr> {
+    resolve_doh_all(host).into_iter().next()
+}
+
+/// Minimal dependency-free parser for DoH DNS-JSON `"Answer"` A records (`type: 1`).
+pub(crate) fn parse_doh_a_records(body: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let Some(ans_pos) = find_json_key(body, "Answer") else {
+        return out;
+    };
     let rest = body[ans_pos..].trim_start();
     if !rest.starts_with('[') {
-        return None;
+        return out;
     }
-    let arr_end = find_matching_delim(rest, b'[', b']')?;
+    let Some(arr_end) = find_matching_delim(rest, b'[', b']') else {
+        return out;
+    };
     let arr = &rest[1..arr_end];
 
     let mut i = 0;
@@ -403,7 +422,10 @@ pub(crate) fn parse_doh_a_record(body: &str) -> Option<IpAddr> {
                 if obj_is_type_a(obj) {
                     if let Some(data_val) = obj_get_string(obj, "data") {
                         if let Ok(ip) = data_val.parse::<Ipv4Addr>() {
-                            return Some(IpAddr::V4(ip));
+                            let addr = IpAddr::V4(ip);
+                            if !out.contains(&addr) {
+                                out.push(addr);
+                            }
                         }
                     }
                 }
@@ -415,7 +437,12 @@ pub(crate) fn parse_doh_a_record(body: &str) -> Option<IpAddr> {
         }
         i += 1;
     }
-    None
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn parse_doh_a_record(body: &str) -> Option<IpAddr> {
+    parse_doh_a_records(body).into_iter().next()
 }
 
 fn skip_str(s: &str, mut i: usize) -> usize {
@@ -586,13 +613,26 @@ pub fn start_proxy() -> bool {
 }
 
 fn connect_upstream(host: &str, port: u16) -> Option<TcpStream> {
-    let ip = resolve_doh(host);
-    let addr = ip.map(|ip| SocketAddr::new(ip, port));
-    let res = addr.and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(8)).ok());
-    record(host, res.is_some(), ip, None);
-    let s = res?;
-    let _ = s.set_nodelay(true);
-    Some(s)
+    let ips = resolve_doh_all(host);
+    let mut connected: Option<(TcpStream, IpAddr)> = None;
+    for ip in ips.iter().take(2) {
+        let addr = SocketAddr::new(*ip, port);
+        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(6)) {
+            connected = Some((s, *ip));
+            break;
+        }
+    }
+    match connected {
+        Some((s, ip)) => {
+            let _ = s.set_nodelay(true);
+            record(host, true, Some(ip), None);
+            Some(s)
+        }
+        None => {
+            record(host, false, ips.first().copied(), None);
+            None
+        }
+    }
 }
 
 fn relay_one_way(src: &mut TcpStream, dst: &mut TcpStream) {
@@ -700,42 +740,94 @@ fn handle(mut c: TcpStream) -> Option<()> {
         };
         let host = raw_host.trim_matches(|ch| ch == '[' || ch == ']');
         let mut up = connect_upstream(host, port)?;
+        let mut req_bytes = Vec::with_capacity(n);
         if let Some(crlf) = buf[..n].windows(2).position(|w| w == b"\r\n") {
             let new_req_line = format!("{method} {path} {version}");
-            up.write_all(new_req_line.as_bytes()).ok()?;
-            up.write_all(&buf[crlf..n]).ok()?;
+            req_bytes.extend_from_slice(new_req_line.as_bytes());
+            req_bytes.extend_from_slice(&buf[crlf..n]);
         } else {
-            up.write_all(&buf[..n]).ok()?;
+            req_bytes.extend_from_slice(&buf[..n]);
+        }
+        if req_bytes.len() > 6 {
+            up.write_all(&req_bytes[..3]).ok()?;
+            up.flush().ok()?;
+            thread::sleep(Duration::from_millis(15));
+            up.write_all(&req_bytes[3..]).ok()?;
+        } else {
+            up.write_all(&req_bytes).ok()?;
         }
         relay_bidirectional(c, up);
     }
     Some(())
 }
 
+fn is_bogon_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+}
+
+pub(crate) fn classify_dns(sys_ips: &[IpAddr], doh_ips: &[IpAddr]) -> DnsState {
+    if doh_ips.is_empty() {
+        return DnsState::Unknown;
+    }
+    if sys_ips.is_empty() {
+        return DnsState::Failed;
+    }
+    for ip in sys_ips {
+        if let IpAddr::V4(v4) = ip {
+            if is_bogon_v4(*v4) {
+                return DnsState::Poisoned;
+            }
+        }
+    }
+    for s in sys_ips {
+        if doh_ips.contains(s) {
+            return DnsState::Clean;
+        }
+        if let IpAddr::V4(sv4) = s {
+            let so = sv4.octets();
+            for d in doh_ips {
+                if let IpAddr::V4(dv4) = d {
+                    let do_ = dv4.octets();
+                    if so[0] == do_[0] && so[1] == do_[1] {
+                        return DnsState::Clean;
+                    }
+                }
+            }
+        }
+    }
+    DnsState::Poisoned
+}
+
 fn probe_host(host: &str) {
-    let sys = (host, 443u16)
+    let sys_ips: Vec<IpAddr> = (host, 443u16)
         .to_socket_addrs()
         .ok()
-        .and_then(|mut it| it.find(|a| a.is_ipv4()))
-        .map(|a| a.ip());
-    let doh = resolve_doh(host).or_else(|| {
-        if !host.starts_with("www.") {
-            resolve_doh(&format!("www.{host}"))
-        } else {
-            None
+        .map(|it| {
+            it.filter(|a| a.is_ipv4())
+                .map(|a| a.ip())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut doh_ips = resolve_doh_all(host);
+    if doh_ips.is_empty() && !host.starts_with("www.") {
+        doh_ips = resolve_doh_all(&format!("www.{host}"));
+    }
+    let dns = classify_dns(&sys_ips, &doh_ips);
+    let mut ok = false;
+    let mut used_ip = doh_ips.first().copied();
+    for ip in doh_ips.iter().take(2) {
+        if TcpStream::connect_timeout(&SocketAddr::new(*ip, 443), Duration::from_secs(6)).is_ok() {
+            ok = true;
+            used_ip = Some(*ip);
+            break;
         }
-    });
-    let dns = match (sys, doh) {
-        (None, Some(_)) => DnsState::Failed,
-        (Some(a), Some(b)) if a == b => DnsState::Clean,
-        (Some(_), Some(_)) => DnsState::Poisoned,
-        _ => DnsState::Unknown,
-    };
-    let ok = match doh {
-        Some(ip) => TcpStream::connect_timeout(&SocketAddr::new(ip, 443), Duration::from_secs(6)).is_ok(),
-        None => false,
-    };
-    record(host, ok, doh, Some(dns));
+    }
+    record(host, ok, used_ip, Some(dns));
 }
 
 pub fn test_single_host(host: String) {
@@ -804,6 +896,30 @@ pub fn run_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_cdn_and_poisoned_dns_accurately() {
+        let doh = vec![
+            IpAddr::V4(Ipv4Addr::new(37, 19, 207, 37)),
+            IpAddr::V4(Ipv4Addr::new(37, 19, 207, 38)),
+        ];
+        // Rotating edge IP in same /16 -> Clean
+        assert_eq!(
+            classify_dns(&[IpAddr::V4(Ipv4Addr::new(37, 19, 207, 99))], &doh),
+            DnsState::Clean
+        );
+        // Empty system DNS -> Failed
+        assert_eq!(classify_dns(&[], &doh), DnsState::Failed);
+        // Bogon / loopback / private -> Poisoned
+        assert_eq!(
+            classify_dns(&[IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))], &doh),
+            DnsState::Poisoned
+        );
+        assert_eq!(
+            classify_dns(&[IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))], &doh),
+            DnsState::Poisoned
+        );
+    }
 
     #[test]
     fn pac_includes_custom_domains() {

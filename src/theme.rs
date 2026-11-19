@@ -46,8 +46,9 @@ impl Color {
 // ---- Color tokens ----
 pub const BG: Color = Color::rgb(0x0D, 0x10, 0x17);
 pub const SURFACE: Color = Color::rgb(0x14, 0x19, 0x23);
-pub const SURFACE_INSET: Color = Color::rgb(0x10, 0x14, 0x1D);
+pub const SURFACE_INSET: Color = Color::rgb(0x0F, 0x13, 0x1B);
 pub const SURFACE_HOVER: Color = Color::rgb(0x1B, 0x22, 0x30);
+pub const SURFACE_ELEV: Color = Color::rgb(0x1F, 0x28, 0x38);
 pub const BTN_BG: Color = Color::rgb(0x1B, 0x22, 0x30);
 pub const BTN_HOVER: Color = Color::rgb(0x24, 0x2E, 0x42);
 pub const BORDER: Color = Color::rgb(0x23, 0x2A, 0x38);
@@ -70,13 +71,13 @@ pub const fn tint(c: Color) -> Color {
     c.with_alpha(34)
 }
 
-// ---- Window & layout tokens (logical px at 96 DPI) ----
-pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 544.0;
-pub const MIN_W: f32 = 420.0;
-pub const MIN_H: f32 = 480.0;
+// ---- Window & layout tokens (logical px at 96 DPI, 8px grid) ----
+pub const WIN_W: f32 = 480.0;
+pub const WIN_H: f32 = 508.0;
+pub const MIN_W: f32 = 440.0;
+pub const MIN_H: f32 = 468.0;
 
-pub const PAD_X: f32 = 18.0;
+pub const PAD_X: f32 = 20.0;
 pub const R_CARD: f32 = 12.0;
 pub const R_BTN: f32 = 8.0;
 pub const R_SM: f32 = 6.0;
