@@ -72,9 +72,9 @@ pub const fn tint(c: Color) -> Color {
 
 // ---- Window & layout tokens (logical px at 96 DPI) ----
 pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 476.0;
+pub const WIN_H: f32 = 544.0;
 pub const MIN_W: f32 = 420.0;
-pub const MIN_H: f32 = 440.0;
+pub const MIN_H: f32 = 480.0;
 
 pub const PAD_X: f32 = 18.0;
 pub const R_CARD: f32 = 12.0;

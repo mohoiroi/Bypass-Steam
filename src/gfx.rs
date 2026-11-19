@@ -421,6 +421,40 @@ impl Canvas {
         }
     }
 
+    pub fn draw_checkmark(&mut self, cx: f32, cy: f32, size: f32, width: f32, color: Color) {
+        let gp = self.ensure_gp();
+        if gp.is_null() {
+            return;
+        }
+        let s = self.scale;
+        let pts = [
+            PointF { X: (cx - size * 0.42) * s, Y: (cy + size * 0.02) * s },
+            PointF { X: (cx - size * 0.10) * s, Y: (cy + size * 0.34) * s },
+            PointF { X: (cx + size * 0.44) * s, Y: (cy - size * 0.32) * s },
+        ];
+        unsafe {
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(color.argb(), width * s, UnitPixel, &mut pen);
+            if !pen.is_null() {
+                GdipSetPenStartCap(pen, LineCapRound);
+                GdipSetPenEndCap(pen, LineCapRound);
+                GdipSetPenLineJoin(pen, LineJoinRound);
+                GdipDrawLines(gp, pen, pts.as_ptr(), 3);
+                GdipDeletePen(pen);
+            }
+        }
+    }
+
+    pub fn draw_plus(&mut self, cx: f32, cy: f32, r: f32, width: f32, color: Color) {
+        self.draw_line(cx - r, cy, cx + r, cy, width, color, true);
+        self.draw_line(cx, cy - r, cx, cy + r, width, color, true);
+    }
+
+    pub fn draw_cross(&mut self, cx: f32, cy: f32, r: f32, width: f32, color: Color) {
+        self.draw_line(cx - r, cy - r, cx + r, cy + r, width, color, true);
+        self.draw_line(cx + r, cy - r, cx - r, cy + r, width, color, true);
+    }
+
     /// Draw the minimal blue squircle + jumping-arc logo matching `icon.ico`.
     pub fn draw_logo(&mut self, x: f32, y: f32, size: f32) {
         self.fill_round_rect(RectF::new(x, y, size, size), size * 0.28, ACCENT);

@@ -22,7 +22,6 @@ pub const APP_TITLE: &str = "Steam Bypass";
 pub const PORT: u16 = 8899;
 pub const WM_APP_STATS: u32 = WM_APP + 2;
 
-const PAC_URL: &str = "http://127.0.0.1:8899/proxy.pac";
 const IE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 const DOMAINS: &[&str] = &[
@@ -39,13 +38,16 @@ const DOMAINS: &[&str] = &[
     "steam.tv",
 ];
 
-pub const GROUPS: [(&str, &str); 6] = [
+pub const CUSTOM_GROUP_IDX: usize = 6;
+
+pub const GROUPS: [(&str, &str); 7] = [
     ("Cửa hàng", "Store, giỏ hàng, khuyến mãi"),
     ("Cộng đồng", "Hồ sơ, bạn bè, workshop"),
     ("Đăng nhập & API", "Tài khoản, Steam Guard, API"),
     ("Tải game (CDN)", "Máy chủ tải game & cập nhật"),
     ("Hình ảnh & media", "Ảnh, avatar, video"),
-    ("Khác", "Tên miền Valve khác"),
+    ("Khác (Steam)", "Tên miền Valve khác"),
+    ("Web tùy chỉnh", "Các trang web bạn thêm"),
 ];
 
 pub const CATALOG: &[&str] = &[
@@ -61,20 +63,40 @@ pub const CATALOG: &[&str] = &[
     "avatars.akamai.steamstatic.com",
 ];
 
+fn domain_matches(host: &str, domain: &str) -> bool {
+    host == domain
+        || (host.len() > domain.len()
+            && host.ends_with(domain)
+            && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
+}
+
+pub fn is_builtin_domain(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    DOMAINS.iter().any(|d| domain_matches(&h, d))
+}
+
 fn group_of(host: &str) -> usize {
     let h = host.to_ascii_lowercase();
-    if h == "store.steampowered.com" || h.ends_with(".store.steampowered.com") {
+    if domain_matches(&h, "store.steampowered.com") {
         0
-    } else if h.ends_with("steamcommunity.com") {
+    } else if domain_matches(&h, "steamcommunity.com") {
         1
-    } else if h.ends_with("steampowered.com") || h.ends_with("steam-api.com") {
+    } else if domain_matches(&h, "steampowered.com") || domain_matches(&h, "steam-api.com") {
         2
-    } else if h.ends_with("steamcontent.com") || h.ends_with("akamaihd.net") || h.ends_with("steamserver.net") {
+    } else if domain_matches(&h, "steamcontent.com")
+        || domain_matches(&h, "akamaihd.net")
+        || domain_matches(&h, "steamserver.net")
+    {
         3
-    } else if h.ends_with("steamstatic.com") || h.ends_with("steamusercontent.com") || h.ends_with("steam.tv") {
+    } else if domain_matches(&h, "steamstatic.com")
+        || domain_matches(&h, "steamusercontent.com")
+        || domain_matches(&h, "steam.tv")
+    {
         4
-    } else {
+    } else if domain_matches(&h, "valvesoftware.com") || domain_matches(&h, "steamgames.com") {
         5
+    } else {
+        CUSTOM_GROUP_IDX
     }
 }
 
@@ -98,9 +120,11 @@ pub struct Stat {
 }
 
 pub static STATS: Mutex<BTreeMap<String, Stat>> = Mutex::new(BTreeMap::new());
+pub static CUSTOM_DOMAINS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static PENDING: AtomicUsize = AtomicUsize::new(0);
 
+static PAC_VERSION: AtomicUsize = AtomicUsize::new(1);
 static UI_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static UI_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -125,6 +149,80 @@ pub fn notify_ui() {
     }
 }
 
+pub fn init_custom_domains() {
+    let loaded = crate::config::load_custom_domains();
+    let mut list = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+    *list = loaded;
+}
+
+pub fn custom_domains() -> Vec<String> {
+    CUSTOM_DOMAINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn add_custom_domain(raw: &str) -> Result<String, &'static str> {
+    let domain = crate::config::normalize_domain(raw)?;
+    if is_builtin_domain(&domain) {
+        return Err("Tên miền Steam đã được hỗ trợ sẵn");
+    }
+    {
+        let mut list = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+        if list.iter().any(|d| d == &domain) {
+            return Err("Tên miền này đã có trong danh sách");
+        }
+        list.push(domain.clone());
+        let _ = crate::config::save_custom_domains(&list);
+    }
+    {
+        let mut m = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(domain.clone()).or_insert(Stat {
+            group: CUSTOM_GROUP_IDX,
+            ..Default::default()
+        });
+    }
+    if ENABLED.load(Ordering::SeqCst) {
+        set_pac(true);
+    }
+    test_single_host(domain.clone());
+    notify_ui();
+    Ok(domain)
+}
+
+pub fn remove_custom_domain(domain: &str) -> bool {
+    let target = domain.to_ascii_lowercase();
+    let remaining: Vec<String>;
+    {
+        let mut list = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = list.len();
+        list.retain(|d| d != &target);
+        if list.len() == before {
+            return false;
+        }
+        remaining = list.clone();
+        let _ = crate::config::save_custom_domains(&list);
+    }
+    {
+        let mut m = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|host, stat| {
+            if stat.group != CUSTOM_GROUP_IDX {
+                return true;
+            }
+            if domain_matches(host, &target) {
+                // Keep only if still covered by another remaining custom domain
+                return remaining.iter().any(|d| domain_matches(host, d));
+            }
+            true
+        });
+    }
+    if ENABLED.load(Ordering::SeqCst) {
+        set_pac(true);
+    }
+    notify_ui();
+    true
+}
+
 pub fn snapshot() -> Vec<(String, Stat)> {
     let mut v: Vec<(String, Stat)> = STATS
         .lock()
@@ -137,10 +235,17 @@ pub fn snapshot() -> Vec<(String, Stat)> {
 }
 
 pub fn seed_stats() {
+    let custom = custom_domains();
     let mut m = STATS.lock().unwrap_or_else(|e| e.into_inner());
     for h in CATALOG {
         m.entry((*h).to_string()).or_insert(Stat {
             group: group_of(h),
+            ..Default::default()
+        });
+    }
+    for h in custom {
+        m.entry(h).or_insert(Stat {
+            group: CUSTOM_GROUP_IDX,
             ..Default::default()
         });
     }
@@ -404,18 +509,25 @@ fn obj_get_string<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
 }
 
 // ---------------- PAC & Windows Registry ----------------
-fn pac(enabled: bool) -> String {
+pub(crate) fn build_pac(enabled: bool, extra_domains: &[String]) -> String {
     if !enabled {
         return "function FindProxyForURL(url,host){return \"DIRECT\";}".to_string();
     }
     let conds: Vec<String> = DOMAINS
         .iter()
+        .copied()
+        .chain(extra_domains.iter().map(String::as_str))
         .map(|d| format!("dnsDomainIs(host,\".{d}\")||host==\"{d}\""))
         .collect();
     format!(
         "function FindProxyForURL(url,host){{if({}){{return \"PROXY 127.0.0.1:{PORT}\";}}return \"DIRECT\";}}",
         conds.join("||")
     )
+}
+
+fn pac(enabled: bool) -> String {
+    let extra = custom_domains();
+    build_pac(enabled, &extra)
 }
 
 pub fn set_pac(enable: bool) {
@@ -426,7 +538,9 @@ pub fn set_pac(enable: bool) {
         let rc = RegCreateKeyW(HKEY_CURRENT_USER, key_w.as_ptr(), &mut hkey);
         if rc == 0 && !hkey.is_null() {
             if enable {
-                let val_w = wide(PAC_URL);
+                let ver = PAC_VERSION.fetch_add(1, Ordering::SeqCst);
+                let url = format!("http://127.0.0.1:{PORT}/proxy.pac?v={ver}");
+                let val_w = wide(&url);
                 RegSetValueExW(
                     hkey,
                     name_w.as_ptr(),
@@ -567,7 +681,7 @@ fn handle(mut c: TcpStream) -> Option<()> {
             up.write_all(&hello[..k]).ok()?;
         }
         relay_bidirectional(c, up);
-    } else if target.starts_with("/proxy.pac") || target.ends_with("/proxy.pac") {
+    } else if target.starts_with("/proxy.pac") || target.contains("/proxy.pac") {
         let body = pac(ENABLED.load(Ordering::SeqCst));
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -598,37 +712,65 @@ fn handle(mut c: TcpStream) -> Option<()> {
     Some(())
 }
 
-/// Active check of every catalog host: ISP DNS vs DoH, then a real TCP connect.
+fn probe_host(host: &str) {
+    let sys = (host, 443u16)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.find(|a| a.is_ipv4()))
+        .map(|a| a.ip());
+    let doh = resolve_doh(host).or_else(|| {
+        if !host.starts_with("www.") {
+            resolve_doh(&format!("www.{host}"))
+        } else {
+            None
+        }
+    });
+    let dns = match (sys, doh) {
+        (None, Some(_)) => DnsState::Failed,
+        (Some(a), Some(b)) if a == b => DnsState::Clean,
+        (Some(_), Some(_)) => DnsState::Poisoned,
+        _ => DnsState::Unknown,
+    };
+    let ok = match doh {
+        Some(ip) => TcpStream::connect_timeout(&SocketAddr::new(ip, 443), Duration::from_secs(6)).is_ok(),
+        None => false,
+    };
+    record(host, ok, doh, Some(dns));
+}
+
+pub fn test_single_host(host: String) {
+    PENDING.fetch_add(1, Ordering::SeqCst);
+    notify_ui();
+    let _ = thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            probe_host(&host);
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            notify_ui();
+        });
+}
+
+/// Active check of every catalog & custom host: ISP DNS vs DoH, then a real TCP connect.
 pub fn run_test() {
+    let mut hosts: Vec<String> = CATALOG.iter().map(|s| (*s).to_string()).collect();
+    for h in custom_domains() {
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
     if PENDING
-        .compare_exchange(0, CATALOG.len(), Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(0, hosts.len(), Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
     }
     notify_ui();
 
-    for host in CATALOG {
+    for host in hosts {
         let _ = thread::Builder::new()
             .stack_size(512 * 1024)
             .spawn(move || {
-                let sys = (*host, 443u16)
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut it| it.find(|a| a.is_ipv4()))
-                    .map(|a| a.ip());
-                let doh = resolve_doh(host);
-                let dns = match (sys, doh) {
-                    (None, Some(_)) => DnsState::Failed,
-                    (Some(a), Some(b)) if a == b => DnsState::Clean,
-                    (Some(_), Some(_)) => DnsState::Poisoned,
-                    _ => DnsState::Unknown,
-                };
-                let ok = match doh {
-                    Some(ip) => TcpStream::connect_timeout(&SocketAddr::new(ip, 443), Duration::from_secs(6)).is_ok(),
-                    None => false,
-                };
-                record(host, ok, doh, Some(dns));
+                probe_host(&host);
                 if PENDING.fetch_sub(1, Ordering::SeqCst) == 1 {
                     notify_ui();
                     let all_failed = STATS
@@ -662,6 +804,17 @@ pub fn run_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pac_includes_custom_domains() {
+        let extra = vec!["reddit.com".to_string(), "bbc.com".to_string()];
+        let script = build_pac(true, &extra);
+        assert!(script.contains(r#"dnsDomainIs(host,".steampowered.com")"#));
+        assert!(script.contains(r#"dnsDomainIs(host,".reddit.com")||host=="reddit.com""#));
+        assert!(script.contains(r#"dnsDomainIs(host,".bbc.com")||host=="bbc.com""#));
+        let off = build_pac(false, &extra);
+        assert_eq!(off, r#"function FindProxyForURL(url,host){return "DIRECT";}"#);
+    }
 
     #[test]
     fn parses_direct_a_record() {

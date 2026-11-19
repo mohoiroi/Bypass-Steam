@@ -1,3 +1,5 @@
 /target
+/dist
+*.zip
 *.bmp
 logo_preview_32.png

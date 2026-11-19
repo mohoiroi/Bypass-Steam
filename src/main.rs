@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! Steam Bypass — compact native Win32/GDI+ tray app for bypassing ISP DNS & SNI blocking.
 
+mod config;
 mod gfx;
 mod proxy;
 mod theme;
@@ -13,30 +14,35 @@ use windows_sys::Win32::UI::{
 };
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("off") {
+    if std::env::args().any(|a| a == "off") {
         proxy::set_pac(false);
         return;
     }
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
 
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
     if !proxy::start_proxy() {
-        unsafe {
-            let h = FindWindowW(proxy::wide(ui::WND_CLASS).as_ptr(), null());
-            if !h.is_null() {
-                PostMessageW(h, ui::WM_APP_SHOW, 0, 0);
-                SetForegroundWindow(h);
+        if !start_minimized {
+            unsafe {
+                let h = FindWindowW(proxy::wide(ui::WND_CLASS).as_ptr(), null());
+                if !h.is_null() {
+                    PostMessageW(h, ui::WM_APP_SHOW, 0, 0);
+                    SetForegroundWindow(h);
+                }
             }
         }
         return;
     }
 
+    config::sync_autostart_path();
+    proxy::init_custom_domains();
     proxy::seed_stats();
     proxy::set_enabled(true);
 
     let _gdip = gfx::GdiplusGuard::new();
-    ui::run();
+    ui::run(start_minimized);
     proxy::set_pac(false);
 }

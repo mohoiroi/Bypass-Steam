@@ -1,7 +1,11 @@
-//! Pure Win32 + GDI+ window, system tray, and compact accordion UI.
+//! Pure Win32 + GDI+ window, system tray, custom domain input, and compact accordion UI.
 
+use crate::config;
 use crate::gfx::{Canvas, FontSet, RectF};
-use crate::proxy::{self, APP_TITLE, DnsState, ENABLED, GROUPS, PENDING, PORT, Stat, UI_DIRTY, WM_APP_STATS, wide};
+use crate::proxy::{
+    self, APP_TITLE, CUSTOM_GROUP_IDX, DnsState, ENABLED, GROUPS, PENDING, PORT, Stat, UI_DIRTY,
+    WM_APP_STATS, wide,
+};
 use crate::theme::*;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::Ordering;
@@ -11,31 +15,52 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
-        Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+        Input::KeyboardAndMouse::{
+            SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN,
+        },
         Shell::*,
         WindowsAndMessaging::*,
     },
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+const ES_LEFT: u32 = 0x0000;
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const EN_SETFOCUS: u32 = 0x0100;
+const EN_KILLFOCUS: u32 = 0x0200;
+const EN_CHANGE: u32 = 0x0300;
 
 pub const WND_CLASS: &str = "SteamBypassMainWnd";
 pub const WM_APP_SHOW: u32 = WM_APP + 3;
+const WM_APP_ADD_DOMAIN: u32 = WM_APP + 4;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_TRAY_ICON: u32 = 1;
 const ID_TIMER_ANIM: usize = 1;
+const ID_TIMER_NOTICE: usize = 2;
+const ID_EDIT_DOMAIN: usize = 101;
 
 const ID_MENU_OPEN: usize = 1;
 const ID_MENU_TOGGLE: usize = 2;
 const ID_MENU_TEST: usize = 3;
-const ID_MENU_EXIT: usize = 4;
+const ID_MENU_AUTOSTART: usize = 4;
+const ID_MENU_EXIT: usize = 5;
+
+const ADD_BAR_Y: f32 = 138.0;
+const ADD_BAR_H: f32 = 34.0;
+const ADD_BTN_W: f32 = 78.0;
+const ADD_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     ToggleBypass,
     RunTest,
+    FocusInput,
+    AddDomain,
     ToggleGroup(usize),
+    RemoveDomain(usize),
+    ToggleAutostart,
     QuitApp,
 }
 
@@ -44,37 +69,63 @@ struct UiState {
     fonts: FontSet,
     hover: Option<Action>,
     tracking_mouse: bool,
-    cursor_hand: bool,
-    expanded: [bool; 6],
+    expanded: [bool; GROUPS.len()],
     scroll_y: f32,
     max_scroll: f32,
+    scroll_to_bottom: bool,
     services_rect: RectF,
     toggle_t: f32,
     spin_deg: f32,
     anim_timer: bool,
     hits: Vec<(RectF, Action)>,
+    remove_targets: Vec<String>,
     taskbar_msg: u32,
     last_tray_on: bool,
+    autostart: bool,
+    edit_hwnd: HWND,
+    edit_bg_brush: HBRUSH,
+    edit_focused: bool,
+    edit_has_text: bool,
+    notice: Option<(String, Color)>,
 }
 
 impl UiState {
-    fn new(dpi: u32, on: bool, taskbar_msg: u32) -> Self {
+    fn new(dpi: u32, on: bool, autostart: bool, taskbar_msg: u32) -> Self {
+        let edit_bg_brush = unsafe { CreateSolidBrush(SURFACE_INSET.colorref()) };
         Self {
             dpi,
             fonts: FontSet::new(dpi),
             hover: None,
             tracking_mouse: false,
-            cursor_hand: false,
-            expanded: [false; 6],
+            expanded: [false; GROUPS.len()],
             scroll_y: 0.0,
             max_scroll: 0.0,
+            scroll_to_bottom: false,
             services_rect: RectF::default(),
             toggle_t: if on { 1.0 } else { 0.0 },
             spin_deg: 0.0,
             anim_timer: false,
-            hits: Vec::with_capacity(16),
+            hits: Vec::with_capacity(24),
+            remove_targets: Vec::new(),
             taskbar_msg,
             last_tray_on: on,
+            autostart,
+            edit_hwnd: null_mut(),
+            edit_bg_brush,
+            edit_focused: false,
+            edit_has_text: false,
+            notice: None,
+        }
+    }
+}
+
+impl Drop for UiState {
+    fn drop(&mut self) {
+        if !self.edit_bg_brush.is_null() {
+            unsafe {
+                DeleteObject(self.edit_bg_brush as HGDIOBJ);
+            }
+            self.edit_bg_brush = null_mut();
         }
     }
 }
@@ -146,6 +197,11 @@ fn host_dot_color(h: Health) -> Color {
     }
 }
 
+fn input_bar_rect(lw: f32) -> RectF {
+    let cw = (lw - PAD_X * 2.0).max(200.0);
+    RectF::new(PAD_X, ADD_BAR_Y, (cw - ADD_BTN_W - ADD_GAP).max(100.0), ADD_BAR_H)
+}
+
 // ---------------- Pure UI Rendering ----------------
 fn paint_ui(
     hdc: HDC,
@@ -153,13 +209,15 @@ fn paint_ui(
     phys_h: i32,
     state: &mut UiState,
     snap: &[(String, Stat)],
+    custom_roots: &[String],
     on: bool,
     pending: usize,
 ) {
     let scale = state.dpi as f32 / 96.0;
     let lw = (phys_w as f32 / scale).max(320.0);
-    let lh = (phys_h as f32 / scale).max(300.0);
+    let lh = (phys_h as f32 / scale).max(340.0);
     state.hits.clear();
+    state.remove_targets.clear();
 
     let mut c = Canvas::new(hdc, state.dpi);
 
@@ -235,32 +293,40 @@ fn paint_ui(
         .count();
     let conns_total: u32 = snap.iter().map(|(_, s)| s.ok).sum();
 
-    let hero_sub = if pending > 0 {
-        "Đang kiểm tra kết nối tới các máy chủ Steam…".to_string()
+    let (hero_sub, hero_sub_col) = if let Some((msg, col)) = &state.notice {
+        (msg.clone(), *col)
+    } else if pending > 0 {
+        ("Đang kiểm tra kết nối tới các máy chủ…".to_string(), TEXT_MUTED)
     } else if !on {
-        "Đang kết nối trực tiếp · Không dùng proxy".to_string()
+        ("Đang kết nối trực tiếp · Không dùng proxy".to_string(), TEXT_MUTED)
     } else if fail_total > 0 {
-        format!("{ok_total}/{} tên miền hoạt động · {fail_total} lỗi", snap.len())
+        (format!("{ok_total}/{} tên miền hoạt động · {fail_total} lỗi", snap.len()), TEXT_MUTED)
     } else if ok_total > 0 && dns_fixed_total > 0 {
-        format!("{ok_total}/{} tên miền hoạt động · {dns_fixed_total} DNS đã sửa", snap.len())
+        (
+            format!("{ok_total}/{} tên miền hoạt động · {dns_fixed_total} DNS đã sửa", snap.len()),
+            TEXT_MUTED,
+        )
     } else if ok_total > 0 {
-        format!("{ok_total}/{} tên miền hoạt động · DoH & chia gói TLS", snap.len())
+        (
+            format!("{ok_total}/{} tên miền hoạt động · DoH & chia gói TLS", snap.len()),
+            TEXT_MUTED,
+        )
     } else {
-        "Proxy cục bộ đang sẵn sàng · Chờ kết nối từ Steam".to_string()
+        ("Proxy cục bộ đang sẵn sàng · Chờ kết nối".to_string(), TEXT_MUTED)
     };
     c.draw_text(
         &hero_sub,
         RectF::new(tx, hero.y + 42.0, (max_tx - tx).max(40.0), 18.0),
         state.fonts.caption,
-        TEXT_MUTED,
+        hero_sub_col,
         DT_LEFT,
     );
 
     // 2. Action & Summary Bar
-    let bar_y = 102.0;
-    let bar_h = 32.0;
+    let bar_y = 100.0;
+    let bar_h = 30.0;
     let bar_cy = bar_y + bar_h * 0.5;
-    let sec_title = "Thành phần Steam";
+    let sec_title = "Dịch vụ & tên miền";
     let (sec_w, _) = c.measure_text(sec_title, state.fonts.group);
     c.draw_text(
         sec_title,
@@ -304,7 +370,7 @@ fn paint_ui(
 
     // "Kiểm tra" button (right)
     let btn_w = 104.0;
-    let btn_h = 30.0;
+    let btn_h = 28.0;
     let btn = RectF::new(cx + cw - btn_w, bar_cy - btn_h * 0.5, btn_w, btn_h);
     let btn_hov = pending == 0 && state.hover == Some(Action::RunTest);
     let btn_fill = if pending > 0 {
@@ -347,9 +413,50 @@ fn paint_ui(
         DT_LEFT,
     );
 
-    // 3. Steam Services Accordion Card
-    let card_y = 144.0;
-    let card_h = (lh - 44.0 - card_y).max(120.0);
+    // 3. Add Custom Domain Bar
+    let inp = input_bar_rect(lw);
+    let inp_hov = state.hover == Some(Action::FocusInput);
+    let inp_border = if state.edit_focused {
+        ACCENT
+    } else if inp_hov {
+        Color::lerp(BORDER, ACCENT, 0.45)
+    } else {
+        BORDER
+    };
+    c.fill_round_rect(inp, R_BTN, SURFACE_INSET);
+    c.stroke_round_rect(inp, R_BTN, if state.edit_focused { 1.4 } else { 1.0 }, inp_border);
+    if !state.edit_focused && !state.edit_has_text {
+        c.draw_text(
+            "Thêm tên miền web khác (vd: reddit.com, x.com)…",
+            RectF::new(inp.x + 11.0, inp.y, (inp.w - 20.0).max(40.0), inp.h),
+            state.fonts.caption,
+            TEXT_DIM,
+            DT_LEFT,
+        );
+    }
+    state.hits.push((inp, Action::FocusInput));
+
+    let add_btn = RectF::new(inp.right() + ADD_GAP, ADD_BAR_Y, ADD_BTN_W, ADD_BAR_H);
+    let add_hov = state.hover == Some(Action::AddDomain);
+    c.fill_round_rect(add_btn, R_BTN, if add_hov { ACCENT_HOVER } else { ACCENT });
+    let add_label = "Thêm";
+    let (alw, _) = c.measure_text(add_label, state.fonts.badge);
+    let plus_w = 10.0;
+    let add_gap = 6.0;
+    let add_sx = add_btn.x + ((add_btn.w - (plus_w + add_gap + alw)) * 0.5).max(8.0);
+    c.draw_plus(add_sx + plus_w * 0.5, add_btn.cy(), 4.2, 1.7, WHITE);
+    c.draw_text(
+        add_label,
+        RectF::new(add_sx + plus_w + add_gap, add_btn.y, alw + 4.0, add_btn.h),
+        state.fonts.badge,
+        WHITE,
+        DT_LEFT,
+    );
+    state.hits.push((add_btn, Action::AddDomain));
+
+    // 4. Services & Custom Domains Accordion Card
+    let card_y = 182.0;
+    let card_h = (lh - 64.0 - card_y).max(120.0);
     let card = RectF::new(cx, card_y, cw, card_h);
     c.fill_round_rect(card, R_CARD, SURFACE);
     c.stroke_round_rect(card, R_CARD, 1.0, BORDER);
@@ -373,7 +480,12 @@ fn paint_ui(
         })
         .sum();
     state.max_scroll = (content_h - inner.h).max(0.0);
-    state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll);
+    if state.scroll_to_bottom {
+        state.scroll_y = state.max_scroll;
+        state.scroll_to_bottom = false;
+    } else {
+        state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll);
+    }
 
     let scroll_pad = if state.max_scroll > 0.5 { 8.0 } else { 0.0 };
     c.set_clip(Some(inner));
@@ -403,7 +515,6 @@ fn paint_ui(
                     SURFACE_HOVER,
                 );
             }
-            // Clip hit box to visible services area
             let hit_top = gh_rect.y.max(inner.y);
             let hit_bot = gh_rect.bottom().min(inner.bottom());
             if hit_bot > hit_top {
@@ -497,8 +608,38 @@ fn paint_ui(
                     let hh = host_health(s, pending);
                     c.fill_circle(inner.x + 24.0, hcy, 3.0, host_dot_color(hh));
 
-                    // Right-aligned metadata
                     let mut rx = inner.right() - 10.0 - scroll_pad;
+
+                    // Delete button for user-added custom root domains
+                    let removable = *gi == CUSTOM_GROUP_IDX
+                        && custom_roots.iter().any(|d| d.eq_ignore_ascii_case(host));
+                    if removable {
+                        let del_idx = state.remove_targets.len();
+                        state.remove_targets.push((*host).clone());
+                        let del_sz = 20.0;
+                        let del_r = RectF::new(rx - del_sz, hcy - del_sz * 0.5, del_sz, del_sz);
+                        let del_hov = state.hover == Some(Action::RemoveDomain(del_idx));
+                        if del_hov {
+                            c.fill_round_rect(del_r, 5.0, DANGER.with_alpha(38));
+                        }
+                        c.draw_cross(
+                            del_r.x + del_sz * 0.5,
+                            del_r.cy(),
+                            3.6,
+                            1.5,
+                            if del_hov { DANGER } else { TEXT_DIM },
+                        );
+                        let ht = del_r.y.max(inner.y);
+                        let hb = del_r.bottom().min(inner.bottom());
+                        if hb > ht {
+                            state.hits.push((
+                                RectF::new(del_r.x, ht, del_r.w, hb - ht),
+                                Action::RemoveDomain(del_idx),
+                            ));
+                        }
+                        rx -= del_sz + 6.0;
+                    }
+
                     if s.ok > 0 {
                         let cnt = format!("×{}", s.ok);
                         let (cw_txt, _) = c.measure_text(&cnt, state.fonts.caption);
@@ -580,12 +721,56 @@ fn paint_ui(
 
     c.set_clip(None);
 
-    // 4. Minimal Footer
-    let foot_y = lh - 34.0;
-    let foot_h = 24.0;
+    // 5. Footer Row 1: Autostart checkbox + Tray hint
+    let row1_y = lh - 56.0;
+    let row1_h = 22.0;
+    let row1_cy = row1_y + row1_h * 0.5;
+
+    let auto_hov = state.hover == Some(Action::ToggleAutostart);
+    let cb_sz = 15.0;
+    let cb_rect = RectF::new(cx, row1_cy - cb_sz * 0.5, cb_sz, cb_sz);
+    if state.autostart {
+        c.fill_round_rect(cb_rect, 4.0, if auto_hov { ACCENT_HOVER } else { ACCENT });
+        c.draw_checkmark(cb_rect.x + cb_sz * 0.5, cb_rect.cy(), 8.5, 1.8, WHITE);
+    } else {
+        c.fill_round_rect(cb_rect, 4.0, if auto_hov { SURFACE_HOVER } else { SURFACE_INSET });
+        c.stroke_round_rect(
+            cb_rect,
+            4.0,
+            1.1,
+            if auto_hov { ACCENT } else { BORDER },
+        );
+    }
+    let auto_lbl = "Khởi chạy cùng Windows";
+    let (auto_w, _) = c.measure_text(auto_lbl, state.fonts.caption);
+    c.draw_text(
+        auto_lbl,
+        RectF::new(cx + cb_sz + 8.0, row1_y, auto_w + 6.0, row1_h),
+        state.fonts.caption,
+        if auto_hov || state.autostart { TEXT_SEC } else { TEXT_MUTED },
+        DT_LEFT,
+    );
+    state.hits.push((
+        RectF::new(cx - 2.0, row1_y - 1.0, cb_sz + 8.0 + auto_w + 6.0, row1_h + 2.0),
+        Action::ToggleAutostart,
+    ));
+
+    let hint = "Đóng (×) để chạy nền";
+    let (hint_w, _) = c.measure_text(hint, state.fonts.caption);
+    c.draw_text(
+        hint,
+        RectF::new(cx + cw - hint_w - 2.0, row1_y, hint_w + 4.0, row1_h),
+        state.fonts.caption,
+        TEXT_DIM,
+        DT_RIGHT,
+    );
+
+    // 6. Footer Row 2: Proxy info + Quit
+    let row2_y = lh - 30.0;
+    let row2_h = 22.0;
     let quit_w = 50.0;
     let quit_h = 22.0;
-    let quit_rect = RectF::new(cx + cw - quit_w, foot_y + (foot_h - quit_h) * 0.5, quit_w, quit_h);
+    let quit_rect = RectF::new(cx + cw - quit_w, row2_y, quit_w, quit_h);
     let quit_hov = state.hover == Some(Action::QuitApp);
     if quit_hov {
         c.fill_round_rect(quit_rect, R_SM, DANGER.with_alpha(30));
@@ -599,31 +784,143 @@ fn paint_ui(
     );
     state.hits.push((quit_rect, Action::QuitApp));
 
-    let hint = "Đóng (×) để chạy nền";
-    let (hint_w, _) = c.measure_text(hint, state.fonts.caption);
-    c.draw_text(
-        hint,
-        RectF::new(quit_rect.x - hint_w - 10.0, foot_y, hint_w + 4.0, foot_h),
-        state.fonts.caption,
-        TEXT_DIM,
-        DT_RIGHT,
-    );
-
-    let left_info = format!("127.0.0.1:{PORT} · DoH 1.1.1.1");
-    let left_max = (quit_rect.x - hint_w - 18.0 - cx).max(60.0);
+    let custom_n = custom_roots.len();
+    let left_info = if custom_n > 0 {
+        format!("127.0.0.1:{PORT} · DoH 1.1.1.1 · +{custom_n} web tùy chỉnh")
+    } else {
+        format!("127.0.0.1:{PORT} · DoH 1.1.1.1")
+    };
+    let left_max = (quit_rect.x - 10.0 - cx).max(60.0);
     c.draw_text(
         &left_info,
-        RectF::new(cx, foot_y, left_max, foot_h),
+        RectF::new(cx, row2_y, left_max, row2_h),
         state.fonts.caption,
         TEXT_DIM,
         DT_LEFT,
     );
 }
 
-// ---------------- Win32 Window & Tray ----------------
+// ---------------- Win32 Window, Edit Control & Tray ----------------
 fn get_state<'a>(hwnd: HWND) -> Option<&'a mut UiState> {
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
     if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
+}
+
+fn layout_edit(hwnd: HWND, state: &UiState) {
+    if state.edit_hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetClientRect(hwnd, &mut cr);
+        let scale = state.dpi as f32 / 96.0;
+        let lw = ((cr.right - cr.left).max(1) as f32 / scale).max(320.0);
+        let inp = input_bar_rect(lw);
+        let eh = 18.0;
+        let px = ((inp.x + 10.0) * scale).round() as i32;
+        let py = ((inp.cy() - eh * 0.5) * scale).round() as i32;
+        let pw = ((inp.w - 20.0).max(40.0) * scale).round() as i32;
+        let ph = (eh * scale).round().max(14.0) as i32;
+        SetWindowPos(
+            state.edit_hwnd,
+            null_mut(),
+            px,
+            py,
+            pw,
+            ph,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn read_edit_text(edit: HWND) -> String {
+    if edit.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let len = GetWindowTextLengthW(edit);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let got = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
+        String::from_utf16_lossy(&buf[..got.max(0) as usize])
+    }
+}
+
+fn set_notice(hwnd: HWND, state: &mut UiState, msg: String, color: Color) {
+    state.notice = Some((msg, color));
+    unsafe {
+        SetTimer(hwnd, ID_TIMER_NOTICE, 3500, None);
+    }
+}
+
+fn focus_domain_input(hwnd: HWND, state: &mut UiState) {
+    if state.edit_hwnd.is_null() {
+        return;
+    }
+    layout_edit(hwnd, state);
+    unsafe {
+        ShowWindow(state.edit_hwnd, SW_SHOW);
+        SetFocus(state.edit_hwnd);
+    }
+    state.edit_focused = true;
+}
+
+fn submit_domain_input(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else {
+        return;
+    };
+    let raw = read_edit_text(state.edit_hwnd);
+    if raw.trim().is_empty() {
+        focus_domain_input(hwnd, state);
+        unsafe {
+            InvalidateRect(hwnd, null(), 0);
+        }
+        return;
+    }
+    match proxy::add_custom_domain(&raw) {
+        Ok(domain) => {
+            unsafe {
+                SetWindowTextW(state.edit_hwnd, wide("").as_ptr());
+                if !state.edit_focused {
+                    ShowWindow(state.edit_hwnd, SW_HIDE);
+                }
+            }
+            state.edit_has_text = false;
+            state.expanded[CUSTOM_GROUP_IDX] = true;
+            state.scroll_to_bottom = true;
+            set_notice(hwnd, state, format!("Đã thêm {domain} · Đang kiểm tra…"), SUCCESS);
+            sync_timer(hwnd, state);
+        }
+        Err(err) => {
+            set_notice(hwnd, state, err.to_string(), WARNING);
+        }
+    }
+    unsafe {
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
+fn toggle_autostart_ui(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else {
+        return;
+    };
+    let next = !state.autostart;
+    if config::set_autostart(next) {
+        state.autostart = next;
+        let msg = if next {
+            "Đã bật khởi chạy cùng Windows (chạy ẩn)".to_string()
+        } else {
+            "Đã tắt khởi chạy cùng Windows".to_string()
+        };
+        set_notice(hwnd, state, msg, if next { SUCCESS } else { TEXT_SEC });
+    } else {
+        set_notice(hwnd, state, "Không thể cập nhật khởi chạy cùng Windows".to_string(), DANGER);
+    }
+    unsafe {
+        InvalidateRect(hwnd, null(), 0);
+    }
 }
 
 fn sync_timer(hwnd: HWND, state: &mut UiState) {
@@ -713,6 +1010,9 @@ fn show_main(hwnd: HWND) {
         ShowWindow(hwnd, SW_SHOW);
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
+        if let Some(st) = get_state(hwnd) {
+            layout_edit(hwnd, st);
+        }
         InvalidateRect(hwnd, null(), 0);
     }
 }
@@ -746,6 +1046,7 @@ fn apply_dwm(hwnd: HWND) {
 fn show_tray_menu(hwnd: HWND) {
     let on = ENABLED.load(Ordering::SeqCst);
     let pending = PENDING.load(Ordering::SeqCst) > 0;
+    let autostart = get_state(hwnd).map(|s| s.autostart).unwrap_or_else(config::is_autostart_enabled);
     unsafe {
         let menu = CreatePopupMenu();
         AppendMenuW(
@@ -767,6 +1068,12 @@ fn show_tray_menu(hwnd: HWND) {
             MF_STRING | if pending { MF_GRAYED } else { 0 },
             ID_MENU_TEST,
             wide("Kiểm tra ngay").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING | if autostart { MF_CHECKED } else { 0 },
+            ID_MENU_AUTOSTART,
+            wide("Khởi chạy cùng Windows").as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, ID_MENU_EXIT, wide("Thoát").as_ptr());
@@ -802,6 +1109,7 @@ fn show_tray_menu(hwnd: HWND) {
                 }
                 InvalidateRect(hwnd, null(), 0);
             }
+            ID_MENU_AUTOSTART => toggle_autostart_ui(hwnd),
             ID_MENU_EXIT => {
                 DestroyWindow(hwnd);
             }
@@ -827,6 +1135,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
         match msg {
             WM_ERASEBKGND => 1,
+            WM_SIZE => {
+                if let Some(state) = get_state(hwnd) {
+                    layout_edit(hwnd, state);
+                }
+                0
+            }
             WM_GETMINMAXINFO => {
                 if let Some(state) = get_state(hwnd) {
                     let s = state.dpi as f32 / 96.0;
@@ -849,6 +1163,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if new_dpi >= 72 {
                         state.dpi = new_dpi;
                         state.fonts = FontSet::new(new_dpi);
+                        if !state.edit_hwnd.is_null() {
+                            SendMessageW(state.edit_hwnd, WM_SETFONT, state.fonts.body as usize, 1);
+                        }
                     }
                     let suggested = &*(lp as *const RECT);
                     SetWindowPos(
@@ -860,7 +1177,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         suggested.bottom - suggested.top,
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
+                    layout_edit(hwnd, state);
                     InvalidateRect(hwnd, null(), 0);
+                }
+                0
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = wp as HDC;
+                SetTextColor(hdc, TEXT.colorref());
+                SetBkColor(hdc, SURFACE_INSET.colorref());
+                if let Some(state) = get_state(hwnd) {
+                    return state.edit_bg_brush as LRESULT;
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_COMMAND => {
+                let ctrl_id = (wp & 0xFFFF) as usize;
+                let code = ((wp >> 16) & 0xFFFF) as u32;
+                if ctrl_id == ID_EDIT_DOMAIN {
+                    if let Some(state) = get_state(hwnd) {
+                        match code {
+                            EN_SETFOCUS => {
+                                state.edit_focused = true;
+                                InvalidateRect(hwnd, null(), 0);
+                            }
+                            EN_KILLFOCUS => {
+                                state.edit_focused = false;
+                                state.edit_has_text = GetWindowTextLengthW(state.edit_hwnd) > 0;
+                                if !state.edit_has_text {
+                                    ShowWindow(state.edit_hwnd, SW_HIDE);
+                                }
+                                InvalidateRect(hwnd, null(), 0);
+                            }
+                            EN_CHANGE => {
+                                state.edit_has_text = GetWindowTextLengthW(state.edit_hwnd) > 0;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 0
             }
@@ -878,9 +1232,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
                 if let Some(state) = get_state(hwnd) {
                     let snap = proxy::snapshot();
+                    let custom_roots = proxy::custom_domains();
                     let on = ENABLED.load(Ordering::SeqCst);
                     let pending = PENDING.load(Ordering::SeqCst);
-                    paint_ui(mem_dc, pw, ph, state, &snap, on, pending);
+                    paint_ui(mem_dc, pw, ph, state, &snap, &custom_roots, on, pending);
                 }
 
                 BitBlt(hdc, 0, 0, pw, ph, mem_dc, 0, 0, SRCCOPY);
@@ -906,7 +1261,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let lx = ((lp as u32 & 0xFFFF) as i16) as f32 / s;
                     let ly = (((lp as u32 >> 16) & 0xFFFF) as i16) as f32 / s;
                     let new_hover = hit_test(state, lx, ly);
-                    state.cursor_hand = new_hover.is_some();
                     if new_hover != state.hover {
                         state.hover = new_hover;
                         InvalidateRect(hwnd, null(), 0);
@@ -917,7 +1271,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_MOUSELEAVE => {
                 if let Some(state) = get_state(hwnd) {
                     state.tracking_mouse = false;
-                    state.cursor_hand = false;
                     if state.hover.is_some() {
                         state.hover = None;
                         InvalidateRect(hwnd, null(), 0);
@@ -927,12 +1280,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_SETCURSOR => {
                 if (lp as u32 & 0xFFFF) == HTCLIENT {
-                    let hand = get_state(hwnd).is_some_and(|s| s.cursor_hand);
-                    let cur = LoadCursorW(null_mut(), if hand { IDC_HAND } else { IDC_ARROW });
+                    let cur_id = match get_state(hwnd).and_then(|s| s.hover) {
+                        Some(Action::FocusInput) => IDC_IBEAM,
+                        Some(_) => IDC_HAND,
+                        None => IDC_ARROW,
+                    };
+                    let cur = LoadCursorW(null_mut(), cur_id);
                     SetCursor(cur);
                     return 1;
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_LBUTTONDOWN => {
+                if let Some(state) = get_state(hwnd) {
+                    let s = state.dpi as f32 / 96.0;
+                    let lx = ((lp as u32 & 0xFFFF) as i16) as f32 / s;
+                    let ly = (((lp as u32 >> 16) & 0xFFFF) as i16) as f32 / s;
+                    let hit = hit_test(state, lx, ly);
+                    if hit == Some(Action::FocusInput) {
+                        focus_domain_input(hwnd, state);
+                        InvalidateRect(hwnd, null(), 0);
+                    } else if state.edit_focused && hit != Some(Action::AddDomain) {
+                        SetFocus(hwnd);
+                    }
+                }
+                0
             }
             WM_LBUTTONUP => {
                 let act = get_state(hwnd).and_then(|state| {
@@ -957,10 +1329,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                                 sync_timer(hwnd, state);
                             }
                         }
+                        Action::FocusInput => {
+                            if let Some(state) = get_state(hwnd) {
+                                focus_domain_input(hwnd, state);
+                            }
+                        }
+                        Action::AddDomain => {
+                            submit_domain_input(hwnd);
+                            return 0;
+                        }
                         Action::ToggleGroup(gi) => {
                             if let Some(state) = get_state(hwnd) {
                                 state.expanded[gi] = !state.expanded[gi];
                             }
+                        }
+                        Action::RemoveDomain(idx) => {
+                            let domain = get_state(hwnd)
+                                .and_then(|s| s.remove_targets.get(idx).cloned());
+                            if let Some(d) = domain {
+                                if proxy::remove_custom_domain(&d) {
+                                    if let Some(state) = get_state(hwnd) {
+                                        set_notice(hwnd, state, format!("Đã xóa {d}"), TEXT_SEC);
+                                    }
+                                }
+                            }
+                        }
+                        Action::ToggleAutostart => {
+                            toggle_autostart_ui(hwnd);
+                            return 0;
                         }
                         Action::QuitApp => {
                             DestroyWindow(hwnd);
@@ -996,6 +1392,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     sync_timer(hwnd, state);
                     InvalidateRect(hwnd, null(), 0);
                 }
+                0
+            }
+            WM_TIMER if wp == ID_TIMER_NOTICE => {
+                KillTimer(hwnd, ID_TIMER_NOTICE);
+                if let Some(state) = get_state(hwnd) {
+                    state.notice = None;
+                }
+                InvalidateRect(hwnd, null(), 0);
+                0
+            }
+            WM_APP_ADD_DOMAIN => {
+                submit_domain_input(hwnd);
                 0
             }
             WM_APP_STATS => {
@@ -1037,6 +1445,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_DESTROY => {
+                KillTimer(hwnd, ID_TIMER_NOTICE);
                 if let Some(state) = get_state(hwnd) {
                     if state.anim_timer {
                         KillTimer(hwnd, ID_TIMER_ANIM);
@@ -1057,7 +1466,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-pub fn run() {
+pub fn run(start_minimized: bool) {
     unsafe {
         let hinst = GetModuleHandleW(null());
         let cls_w = wide(WND_CLASS);
@@ -1087,7 +1496,13 @@ pub fn run() {
         RegisterClassW(&wc);
 
         let taskbar_msg = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
-        let state = Box::new(UiState::new(96, ENABLED.load(Ordering::SeqCst), taskbar_msg));
+        let autostart = config::is_autostart_enabled();
+        let state = Box::new(UiState::new(
+            96,
+            ENABLED.load(Ordering::SeqCst),
+            autostart,
+            taskbar_msg,
+        ));
         let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
 
         let hwnd = CreateWindowExW(
@@ -1111,9 +1526,27 @@ pub fn run() {
         // Apply accurate Per-Monitor DPI size & center on primary monitor
         let dpi = GetDpiForWindow(hwnd).max(96);
         let s = dpi as f32 / 96.0;
+        let edit_hwnd = CreateWindowExW(
+            0,
+            wide("EDIT").as_ptr(),
+            null(),
+            WS_CHILD | ES_LEFT | ES_AUTOHSCROLL,
+            0,
+            0,
+            100,
+            20,
+            hwnd,
+            ID_EDIT_DOMAIN as HMENU,
+            hinst,
+            null(),
+        );
         if let Some(st) = get_state(hwnd) {
             st.dpi = dpi;
             st.fonts = FontSet::new(dpi);
+            st.edit_hwnd = edit_hwnd;
+            if !edit_hwnd.is_null() {
+                SendMessageW(edit_hwnd, WM_SETFONT, st.fonts.body as usize, 1);
+            }
         }
         let mut rc = RECT {
             left: 0,
@@ -1126,7 +1559,10 @@ pub fn run() {
         let wh = rc.bottom - rc.top;
         let sx = ((GetSystemMetrics(SM_CXSCREEN) - ww) / 2).max(0);
         let sy = ((GetSystemMetrics(SM_CYSCREEN) - wh) / 2).max(0);
-        SetWindowPos(hwnd, null_mut(), sx, sy, ww, wh, SWP_NOZORDER);
+        SetWindowPos(hwnd, null_mut(), sx, sy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+        if let Some(st) = get_state(hwnd) {
+            layout_edit(hwnd, st);
+        }
 
         apply_dwm(hwnd);
         if !big_icon.is_null() {
@@ -1143,11 +1579,24 @@ pub fn run() {
             sync_timer(hwnd, st);
         }
 
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
+        if start_minimized {
+            ShowWindow(hwnd, SW_HIDE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if msg.message == WM_KEYDOWN && !edit_hwnd.is_null() && msg.hwnd == edit_hwnd {
+                if msg.wParam == VK_RETURN as usize {
+                    SendMessageW(hwnd, WM_APP_ADD_DOMAIN, 0, 0);
+                    continue;
+                } else if msg.wParam == VK_ESCAPE as usize {
+                    SetFocus(hwnd);
+                    continue;
+                }
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1172,12 +1621,30 @@ mod tests {
         }
     }
 
-    fn sample_snap(with_fail: bool) -> Vec<(String, Stat)> {
+    fn sample_snap(with_fail: bool, with_custom: bool) -> Vec<(String, Stat)> {
         let mut v: Vec<(String, Stat)> = vec![
             ("store.steampowered.com".into(), make_stat(0, 4, 0, "23.15.142.182", DnsState::Poisoned)),
-            ("steamcommunity.com".into(), make_stat(1, if with_fail { 0 } else { 3 }, if with_fail { 1 } else { 0 }, "23.210.5.41", DnsState::Poisoned)),
+            (
+                "steamcommunity.com".into(),
+                make_stat(
+                    1,
+                    if with_fail { 0 } else { 3 },
+                    if with_fail { 1 } else { 0 },
+                    "23.210.5.41",
+                    DnsState::Poisoned,
+                ),
+            ),
             ("api.steampowered.com".into(), make_stat(2, 2, 0, "104.16.120.11", DnsState::Clean)),
-            ("help.steampowered.com".into(), make_stat(2, if with_fail { 0 } else { 1 }, if with_fail { 1 } else { 0 }, "23.15.142.182", DnsState::Clean)),
+            (
+                "help.steampowered.com".into(),
+                make_stat(
+                    2,
+                    if with_fail { 0 } else { 1 },
+                    if with_fail { 1 } else { 0 },
+                    "23.15.142.182",
+                    DnsState::Clean,
+                ),
+            ),
             ("login.steampowered.com".into(), make_stat(2, 5, 0, "155.133.248.39", DnsState::Poisoned)),
             ("steamcommunity-a.akamaihd.net".into(), make_stat(3, 6, 0, "23.200.143.5", DnsState::Clean)),
             ("steamcdn-a.akamaihd.net".into(), make_stat(3, 2, 0, "23.200.143.11", DnsState::Clean)),
@@ -1185,11 +1652,24 @@ mod tests {
             ("cdn.akamai.steamstatic.com".into(), make_stat(4, 2, 0, "23.200.143.16", DnsState::Clean)),
             ("cdn.cloudflare.steamstatic.com".into(), make_stat(4, 4, 0, "104.16.124.96", DnsState::Clean)),
         ];
+        if with_custom {
+            v.push(("reddit.com".into(), make_stat(CUSTOM_GROUP_IDX, 3, 0, "151.101.1.140", DnsState::Poisoned)));
+            v.push(("medium.com".into(), make_stat(CUSTOM_GROUP_IDX, 1, 0, "162.159.152.4", DnsState::Clean)));
+        }
         v.sort_by(|a, b| a.1.group.cmp(&b.1.group).then(a.0.cmp(&b.0)));
         v
     }
 
-    fn render_bmp(path: &str, dpi: u32, on: bool, pending: usize, expanded: [bool; 6], snap: &[(String, Stat)]) {
+    fn render_bmp(
+        path: &str,
+        dpi: u32,
+        on: bool,
+        autostart: bool,
+        pending: usize,
+        expanded: [bool; GROUPS.len()],
+        snap: &[(String, Stat)],
+        custom_roots: &[String],
+    ) {
         let _gdip = GdiplusGuard::new();
         let s = dpi as f32 / 96.0;
         let pw = (WIN_W * s).round() as i32;
@@ -1200,7 +1680,7 @@ mod tests {
             let mut bmi: BITMAPINFO = std::mem::zeroed();
             bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
             bmi.bmiHeader.biWidth = pw;
-            bmi.bmiHeader.biHeight = -ph; // top-down DIB
+            bmi.bmiHeader.biHeight = -ph;
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
@@ -1210,26 +1690,26 @@ mod tests {
             assert!(!hbmp.is_null() && !bits.is_null());
             let old = SelectObject(mem_dc, hbmp as HGDIOBJ);
 
-            let mut state = UiState::new(dpi, on, 0);
+            let mut state = UiState::new(dpi, on, autostart, 0);
             state.expanded = expanded;
-            paint_ui(mem_dc, pw, ph, &mut state, snap, on, pending);
+            if expanded[CUSTOM_GROUP_IDX] {
+                state.scroll_to_bottom = true;
+            }
+            paint_ui(mem_dc, pw, ph, &mut state, snap, custom_roots, on, pending);
 
-            // Export 24-bit BGR BMP so ClearType alpha=0 bytes do not become transparent in viewers.
             let src = std::slice::from_raw_parts(bits as *const u8, (pw * ph * 4) as usize);
             let row_stride = ((pw as usize * 3) + 3) & !3;
             let img_size = row_stride * ph as usize;
             let file_size = 54 + img_size;
             let mut out = Vec::with_capacity(file_size);
 
-            // BITMAPFILEHEADER (14 bytes)
             out.extend_from_slice(b"BM");
             out.extend_from_slice(&(file_size as u32).to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&54u32.to_le_bytes());
-            // BITMAPINFOHEADER (40 bytes)
             out.extend_from_slice(&40u32.to_le_bytes());
             out.extend_from_slice(&(pw as i32).to_le_bytes());
-            out.extend_from_slice(&(ph as i32).to_le_bytes()); // bottom-up
+            out.extend_from_slice(&(ph as i32).to_le_bytes());
             out.extend_from_slice(&1u16.to_le_bytes());
             out.extend_from_slice(&24u16.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
@@ -1260,25 +1740,29 @@ mod tests {
     #[test]
     fn render_ui_previews() {
         let dir = env!("CARGO_MANIFEST_DIR");
-        let ok_snap = sample_snap(false);
-        let fail_snap = sample_snap(true);
+        let ok_snap = sample_snap(false, false);
+        let custom_snap = sample_snap(false, true);
+        let custom_roots = vec!["reddit.com".to_string(), "medium.com".to_string()];
 
-        render_bmp(&format!(r"{dir}\target\preview_compact.bmp"), 96, true, 0, [false; 6], &ok_snap);
         render_bmp(
-            &format!(r"{dir}\target\preview_expanded.bmp"),
+            &format!(r"{dir}\target\preview_compact.bmp"),
             96,
             true,
-            0,
-            [false, false, false, true, false, false],
-            &ok_snap,
-        );
-        render_bmp(
-            &format!(r"{dir}\target\preview_off_125.bmp"),
-            120,
             false,
             0,
-            [false, true, false, false, false, false],
-            &fail_snap,
+            [false; GROUPS.len()],
+            &ok_snap,
+            &[],
+        );
+        render_bmp(
+            &format!(r"{dir}\target\preview_custom.bmp"),
+            96,
+            true,
+            true,
+            0,
+            [false, false, false, false, false, false, true],
+            &custom_snap,
+            &custom_roots,
         );
     }
 }
