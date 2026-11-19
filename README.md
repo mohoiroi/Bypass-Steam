@@ -24,12 +24,6 @@
    steam_bypass.exe off
    ```
 
-## Tự build từ mã nguồn
-Yêu cầu Rust (`x86_64-pc-windows-gnu` hoặc `x86_64-pc-windows-msvc`):
-```powershell
-cargo build --release
-```
-File thực thi nằm tại `target\release\steam_bypass.exe`.
 
 ## Giấy phép
 MIT License — xem [LICENSE](LICENSE).
