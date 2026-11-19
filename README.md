@@ -1,7 +1,5 @@
 # Steam Bypass
 
-Ứng dụng Windows siêu nhẹ (~370 KB) viết bằng **Rust + Win32/GDI+/WinHTTP thuần** giúp vượt chặn DNS poisoning và SNI/DPI cho Steam mà **không cần VPN, driver hay quyền quản trị (Admin)**.
-
 ## Tải về
 👉 Tải bản chạy ngay mới nhất tại mục **[Releases](https://github.com/banhcay/Bypass-Steam/releases)**:
 - Tải trực tiếp file `steam_bypass.exe` hoặc file nén `.zip`.
