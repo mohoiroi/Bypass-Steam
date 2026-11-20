@@ -1,10 +1,11 @@
-use crate::proxy::wide;
+use crate::{DISPLAY_VERSION, proxy::wide};
 use std::{ffi::c_void, ptr::{null, null_mut}};
 use windows_sys::Win32::Networking::WinInet::*;
 
 const LATEST: &str = "https://github.com/mohoiroi/Bypass-Steam/releases/latest";
 const TAG_BASE: &str = "https://github.com/mohoiroi/Bypass-Steam/releases/tag/";
-const CURRENT: &str = env!("CARGO_PKG_VERSION");
+// Compare the full Cargo version with numeric GitHub release tags.
+const RELEASE_BASELINE: &str = env!("CARGO_PKG_VERSION");
 
 struct InternetHandle(*mut c_void);
 
@@ -21,25 +22,29 @@ impl Drop for InternetHandle {
 }
 
 fn version(value: &str) -> Option<[u64; 3]> {
+    let numeric = |part: &str| {
+        if part.bytes().all(|c| c.is_ascii_digit()) {
+            part.parse::<u64>().ok()
+        } else {
+            None
+        }
+    };
     let mut parts = value.strip_prefix('v').unwrap_or(value).split('.');
-    let mut result = [0; 3];
-    for number in &mut result {
-        let part = parts.next()?;
-        if !part.bytes().all(|c| c.is_ascii_digit()) { return None; }
-        *number = part.parse().ok()?;
-    }
-    parts.next().is_none().then_some(result)
+    let major = numeric(parts.next()?)?;
+    let minor = numeric(parts.next()?)?;
+    let patch = numeric(parts.next().unwrap_or("0"))?;
+    parts.next().is_none().then_some([major, minor, patch])
 }
 
 fn report(location: &str) -> Option<String> {
     let tag = location.strip_prefix(TAG_BASE)
         .or_else(|| location.strip_prefix("/mohoiroi/Bypass-Steam/releases/tag/"))?;
     let latest = version(tag)?;
-    let current = version(CURRENT)?;
+    let current = version(RELEASE_BASELINE)?;
     Some(if latest > current {
-        format!("Đã có bản {tag}. Phiên bản đang dùng là {CURRENT}.")
+        format!("Đã có bản {tag}. Phiên bản đang dùng là {DISPLAY_VERSION}.")
     } else {
-        format!("Bạn đang dùng phiên bản {CURRENT}. Chưa có bản phát hành mới hơn.")
+        format!("Bạn đang dùng phiên bản {DISPLAY_VERSION}. Chưa có bản phát hành mới hơn.")
     })
 }
 
@@ -75,7 +80,11 @@ mod tests {
     #[test]
     fn compares_numeric_release_tags() {
         assert!(version("v1.10.0") > version("1.9.9"));
-        assert!(report(&format!("{TAG_BASE}v{CURRENT}")).unwrap().contains("Chưa có"));
+        let current = report(&format!("{TAG_BASE}v{RELEASE_BASELINE}")).unwrap();
+        assert!(current.contains(DISPLAY_VERSION) && current.contains("Chưa có"));
+        assert_eq!(version(DISPLAY_VERSION), version(RELEASE_BASELINE));
+        assert_eq!(report(&format!("{TAG_BASE}{DISPLAY_VERSION}")).as_deref(), Some(current.as_str()));
+        assert!(version("v1.").is_none());
         assert!(report(&format!("{TAG_BASE}v999.0.0")).unwrap().contains("Đã có"));
         assert!(report("https://example.org/v999.0.0").is_none());
         assert!(version("v1.4.1-beta").is_none());

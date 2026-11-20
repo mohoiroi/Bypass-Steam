@@ -1,7 +1,7 @@
 //! Leak-free RAII wrappers around Win32 GDI+ (anti-aliased shapes) and GDI ClearType text.
 
 use crate::proxy::wide;
-use crate::theme::{ACCENT, Color, PRIMARY, WHITE};
+use crate::theme::{self, Color};
 use std::ptr::null_mut;
 use windows_sys::Win32::{
     Foundation::RECT,
@@ -471,58 +471,22 @@ impl Canvas {
         self.draw_line(cx + r, cy - r, cx - r, cy + r, width, color, true);
     }
 
-    /// Minimalist geometric DNS / server node vector icon (no emoji).
-    pub fn draw_dns_icon(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
-        self.stroke_circle(cx, cy, r, 1.35, color);
-        self.draw_line(cx - r + 0.5, cy, cx + r - 0.5, cy, 1.15, color.with_alpha(190), false);
-        self.draw_line(cx, cy - r + 0.5, cx, cy + r - 0.5, 1.15, color.with_alpha(190), false);
-    }
-
-    /// Draw the minimal shield-navy squircle + jumping-arc logo matching `MASTER.md`.
     pub fn draw_logo(&mut self, x: f32, y: f32, size: f32) {
         let rect = RectF::new(x, y, size, size);
-        self.fill_round_rect(rect, size * 0.24, PRIMARY);
-        self.stroke_round_rect(rect, size * 0.24, 1.0, ACCENT.with_alpha(120));
-        let k = size / 256.0;
-        let px = |vx: f32| x + vx * k;
-        let py = |vy: f32| y + vy * k;
+        self.fill_round_rect(rect, size * 0.2, theme::surface());
+        self.stroke_round_rect(rect, size * 0.2, 1.0, theme::border());
 
-        // Barrier
-        self.draw_line(
-            px(128.0),
-            py(148.0),
-            px(128.0),
-            py(190.0),
-            20.0 * k,
-            ACCENT,
-            true,
-        );
-        // Arc + left/right legs
-        self.draw_arc(px(128.0), py(136.0), 64.0 * k, 180.0, 180.0, 22.0 * k, WHITE);
-        self.draw_line(px(64.0), py(136.0), px(64.0), py(178.0), 22.0 * k, WHITE, true);
-        self.draw_line(px(192.0), py(136.0), px(192.0), py(178.0), 22.0 * k, WHITE, true);
-
-        // Arrow head
-        let gp = self.ensure_gp();
-        if !gp.is_null() {
-            let s = self.scale;
-            let pts = [
-                PointF { X: px(170.0) * s, Y: py(158.0) * s },
-                PointF { X: px(192.0) * s, Y: py(180.0) * s },
-                PointF { X: px(214.0) * s, Y: py(158.0) * s },
-            ];
-            unsafe {
-                let mut pen: *mut GpPen = null_mut();
-                GdipCreatePen1(WHITE.argb(), 22.0 * k * s, UnitPixel, &mut pen);
-                if !pen.is_null() {
-                    GdipSetPenStartCap(pen, LineCapRound);
-                    GdipSetPenEndCap(pen, LineCapRound);
-                    GdipSetPenLineJoin(pen, LineJoinRound);
-                    GdipDrawLines(gp, pen, pts.as_ptr(), 3);
-                    GdipDeletePen(pen);
-                }
-            }
-        }
+        let scale = size / 24.0;
+        let px = |dx: f32| x + dx * scale;
+        let py = |dy: f32| y + dy * scale;
+        let stroke = 1.7 * scale;
+        let ink = theme::text();
+        self.draw_arc(px(12.0), py(13.0), 5.8 * scale, 180.0, 180.0, stroke, ink);
+        self.draw_line(px(6.2), py(13.0), px(6.2), py(17.0), stroke, ink, true);
+        self.draw_line(px(17.8), py(13.0), px(17.8), py(17.0), stroke, ink, true);
+        self.draw_line(px(15.6), py(15.0), px(17.8), py(17.0), stroke, ink, true);
+        self.draw_line(px(20.0), py(15.0), px(17.8), py(17.0), stroke, ink, true);
+        self.draw_line(px(12.0), py(14.0), px(12.0), py(18.0), stroke, theme::text_dim(), true);
     }
 
     pub fn measure_text(&mut self, text: &str, font: HFONT) -> (f32, f32) {

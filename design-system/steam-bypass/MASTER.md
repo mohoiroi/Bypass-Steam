@@ -13,7 +13,14 @@
 
 ---
 
-## Global Rules
+## Windows desktop
+
+The window uses one full-width workspace. The header holds the app version and proxy action. A compact three-column status panel shows proxy state, average latency and host health. Horizontal tabs switch between Steam, Web khác and Tiện ích. The toolbar includes a native DoH menu with grayscale item backgrounds and a checked provider. The Steam view aligns latency, response counts and state in table columns. State labels use neutral backgrounds and colored text.
+
+The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The runtime theme file owns the desktop colors and sizes.
+
+
+## Original web design reference
 
 ### Color Palette
 

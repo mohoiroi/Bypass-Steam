@@ -1,126 +1,84 @@
-//! Design system tokens generated via UI UX Pro Max (`MASTER.md`):
-//! Minimalist Scientific Utility · Variance 8 (Bold/Asymmetric) · Motion 2 (Subtle) · Density 3 (Spacious).
+//! Steam Bypass desktop palette and layout tokens.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
     pub b: u8,
-    pub a: u8,
 }
 
 impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, a: 255 }
+        Self { r, g, b }
     }
 
-    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self { r, g, b, a }
+    const fn gray(value: u8) -> Self {
+        Self::rgb(value, value, value)
     }
 
-    pub const fn with_alpha(self, a: u8) -> Self {
-        Self { a, ..self }
+    const fn hex(value: u32) -> Self {
+        Self::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
     }
 
     /// 0xAARRGGBB for GDI+.
     pub const fn argb(self) -> u32 {
-        ((self.a as u32) << 24)
-            | ((self.r as u32) << 16)
-            | ((self.g as u32) << 8)
-            | (self.b as u32)
+        0xff00_0000 | ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
 
     /// 0x00BBGGRR for Win32 GDI / DWM.
     pub const fn colorref(self) -> u32 {
         ((self.b as u32) << 16) | ((self.g as u32) << 8) | (self.r as u32)
     }
-
-    pub fn lerp(a: Color, b: Color, t: f32) -> Color {
-        let t = t.clamp(0.0, 1.0);
-        let ch = |x: u8, y: u8| -> u8 {
-            (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
-        };
-        Color::rgba(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), ch(a.a, b.a))
-    }
 }
 
-// ---- Semantic color tokens (from design-system/steam-bypass/MASTER.md) ----
-pub const BG: Color = Color::rgb(0x0F, 0x17, 0x2A);           // --color-background
-pub const SURFACE: Color = Color::rgb(0x19, 0x21, 0x34);      // --color-card
-pub const SURFACE_INSET: Color = Color::rgb(0x10, 0x19, 0x2E);// --color-muted
-pub const SURFACE_HOVER: Color = Color::rgb(0x21, 0x2C, 0x44);
-pub const SURFACE_ELEV: Color = Color::rgb(0x33, 0x41, 0x55); // --color-secondary
-pub const PRIMARY: Color = Color::rgb(0x1E, 0x3A, 0x5F);      // --color-primary (Shield Navy)
-pub const PRIMARY_HOVER: Color = Color::rgb(0x27, 0x4B, 0x7A);
-pub const BTN_BG: Color = Color::rgb(0x1E, 0x29, 0x3B);
-pub const BORDER: Color = Color::rgb(0x2A, 0x36, 0x4F);       // Crisp scientific hairline
-pub const BORDER_SUB: Color = Color::rgb(0x1F, 0x2A, 0x40);
+pub const WIN_W: f32 = 568.0;
+pub const WIN_H: f32 = 474.0;
+pub const MIN_W: f32 = 492.0;
+pub const MIN_H: f32 = 442.0;
 
-pub const TEXT: Color = Color::rgb(0xFF, 0xFF, 0xFF);         // --color-foreground (>15:1)
-pub const TEXT_SEC: Color = Color::rgb(0xE2, 0xE8, 0xF0);     // (>12:1)
-pub const TEXT_MUTED: Color = Color::rgb(0x94, 0xA3, 0xB8);   // --color-muted-foreground (>5.5:1)
-pub const TEXT_DIM: Color = Color::rgb(0x64, 0x74, 0x8B);
-
-pub const ACCENT: Color = Color::rgb(0x22, 0xC5, 0x5E);       // --color-accent (Connected Green)
-pub const ACCENT_HOVER: Color = Color::rgb(0x34, 0xD3, 0x70);
-pub const ON_ACCENT: Color = Color::rgb(0x0F, 0x17, 0x2A);    // --color-on-accent (>8:1)
-pub const INFO: Color = Color::rgb(0x38, 0xBD, 0xF8);         // Telemetry Cyan / Direct CDN
-pub const SUCCESS: Color = Color::rgb(0x22, 0xC5, 0x5E);
-pub const WARNING: Color = Color::rgb(0xF5, 0x9E, 0x0B);
-pub const DANGER: Color = Color::rgb(0xEF, 0x44, 0x44);       // Readable destructive on dark
-pub const DESTRUCTIVE: Color = Color::rgb(0xDC, 0x26, 0x26);  // --color-destructive
-pub const NEUTRAL: Color = Color::rgb(0x47, 0x55, 0x69);
-pub const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
-
-pub const fn tint(c: Color) -> Color {
-    c.with_alpha(30)
-}
-
-// ---- Window & layout tokens (Spacious Density 3/10, 8px base grid) ----
-pub const WIN_W: f32 = 528.0;
-pub const WIN_H: f32 = 620.0;
-pub const MIN_W: f32 = 480.0;
-pub const MIN_H: f32 = 540.0;
-
-pub const PAD_X: f32 = 24.0;
-pub const R_CARD: f32 = 10.0;
-pub const R_BTN: f32 = 8.0;
-pub const R_SM: f32 = 6.0;
+pub const PAD_X: f32 = 16.0;
+pub const R_PANEL: f32 = 8.0;
+pub const R_BTN: f32 = 6.0;
+pub const R_SM: f32 = 4.0;
 
 thread_local! {
     static LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-pub fn is_light() -> bool { LIGHT.get() }
-pub fn set_light(light: bool) { LIGHT.set(light); }
+
+pub fn is_light() -> bool {
+    LIGHT.get()
+}
+
+pub fn set_light(light: bool) {
+    LIGHT.set(light);
+}
 
 macro_rules! theme_color {
-    ($name:ident, $dark:ident, $light:expr) => {
+    ($name:ident, $mode:ident, $dark:literal, $light:literal) => {
         pub fn $name() -> Color {
-            if is_light() {
-                Color::rgb(($light >> 16) as u8, ($light >> 8) as u8, $light as u8)
-            } else { $dark }
+            Color::$mode(if is_light() { $light } else { $dark })
         }
     };
 }
-theme_color!(bg, BG, 0xf1f5f9_u32);
-theme_color!(surface, SURFACE, 0xffffff_u32);
-theme_color!(surface_inset, SURFACE_INSET, 0xf5f8fc_u32);
-theme_color!(surface_hover, SURFACE_HOVER, 0xe4edf6_u32);
-theme_color!(surface_elev, SURFACE_ELEV, 0xd5e1ed_u32);
-theme_color!(primary, PRIMARY, 0xdbeafe_u32);
-theme_color!(primary_hover, PRIMARY_HOVER, 0xcddff1_u32);
-theme_color!(btn_bg, BTN_BG, 0xebf1f7_u32);
-theme_color!(border, BORDER, 0xacbdce_u32);
-theme_color!(border_sub, BORDER_SUB, 0xd7e1eb_u32);
-theme_color!(text, TEXT, 0x142237_u32);
-theme_color!(text_sec, TEXT_SEC, 0x2d4056_u32);
-theme_color!(text_muted, TEXT_MUTED, 0x435972_u32);
-theme_color!(text_dim, TEXT_DIM, 0x52657a_u32);
-theme_color!(accent, ACCENT, 0x087342_u32);
-theme_color!(accent_hover, ACCENT_HOVER, 0x086037_u32);
-theme_color!(on_accent, ON_ACCENT, 0xffffff_u32);
-theme_color!(info, INFO, 0x006a94_u32);
-theme_color!(success, SUCCESS, 0x087342_u32);
-theme_color!(warning, WARNING, 0x885508_u32);
-theme_color!(danger, DANGER, 0xb72732_u32);
-theme_color!(neutral, NEUTRAL, 0x566a80_u32);
+
+// Surfaces, controls, dividers and neutral text are strictly grayscale.
+theme_color!(bg, gray, 0x00, 0xff);
+theme_color!(surface, gray, 0x14, 0xf3);
+theme_color!(surface_inset, gray, 0x0d, 0xfa);
+theme_color!(surface_hover, gray, 0x1d, 0xec);
+theme_color!(border, gray, 0x48, 0xc4);
+theme_color!(border_sub, gray, 0x29, 0xde);
+theme_color!(text, gray, 0xf7, 0x11);
+theme_color!(text_sec, gray, 0xe0, 0x26);
+theme_color!(text_muted, gray, 0xb0, 0x52);
+theme_color!(text_dim, gray, 0x95, 0x65);
+theme_color!(primary, gray, 0xf0, 0x1a);
+theme_color!(primary_hover, gray, 0xd6, 0x3a);
+theme_color!(on_primary, gray, 0x10, 0xff);
+theme_color!(neutral, gray, 0x55, 0x77);
+theme_color!(switch_thumb, gray, 0xf5, 0xff);
+
+// Only text and status marks use chromatic colors.
+theme_color!(info, hex, 0x8cbdff, 0x1559a9);
+theme_color!(success, hex, 0x78dca5, 0x116d3e);
+theme_color!(danger, hex, 0xff8a91, 0xb02135);

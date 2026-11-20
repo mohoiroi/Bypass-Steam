@@ -1,7 +1,6 @@
-//! Pure Win32 + GDI+ window, system tray, segmented tabs, and UI UX Pro Max design system
-//! (Minimalist Scientific · Variance 8 Bold/Asymmetric · Motion 2 Subtle · Density 3 Spacious).
+//! Native Windows interface, system tray and Custom DoH dialog.
 
-use crate::config::{self, CustomDomain};
+use crate::{DISPLAY_VERSION, config::{self, CustomDomain}};
 use crate::gfx::{Canvas, FontSet, RectF};
 use crate::proxy::{
     self, APP_TITLE, CDN_GROUP_IDX, CUSTOM_GROUP_IDX, DIRECT_CDN, DnsState, DohProvider, ENABLED,
@@ -19,11 +18,11 @@ use windows_sys::Win32::{
         Memory::{GlobalLock, GlobalUnlock},
     },
     UI::{
-        Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
+        Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_CHECKED, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_MENU},
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
         Input::KeyboardAndMouse::{
             EnableWindow, GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
-            VK_ESCAPE, VK_RETURN,
+            VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
         },
         Shell::*,
         WindowsAndMessaging::*,
@@ -50,7 +49,6 @@ const WM_APP_ADD_DOMAIN: u32 = WM_APP + 4;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_TRAY_ICON: u32 = 1;
-const ID_TIMER_ANIM: usize = 1;
 const ID_TIMER_NOTICE: usize = 2;
 const ID_EDIT_DOMAIN: usize = 101;
 
@@ -63,20 +61,19 @@ const ID_MENU_RESET_NET: usize = 6;
 const ID_MENU_EXIT: usize = 7;
 const ID_MENU_DOH_BASE: usize = 20;
 
-// Spacious scientific grid anchors (Density 3/10 · Variance 8/10)
-const HERO_Y: f32 = 20.0;
-const HERO_H: f32 = 88.0;
-const DOH_Y: f32 = 120.0;
-const DOH_H: f32 = 44.0;
-const NAV_Y: f32 = 178.0;
-const NAV_H: f32 = 36.0;
-const CARD_Y: f32 = 228.0;
-const FOOTER_RESERVE: f32 = 54.0;
+// Main window sections, in DPI-independent pixels.
+const HEADER_H: f32 = 50.0;
+const SUMMARY_H: f32 = 54.0;
+const TOOLBAR_Y: f32 = HEADER_H + SUMMARY_H;
+const TOOLBAR_H: f32 = 44.0;
+const CONTENT_Y: f32 = TOOLBAR_Y + TOOLBAR_H;
+const FOOTER_H: f32 = 30.0;
+const UTILITY_ROW_H: f32 = 44.0;
 
-const INPUT_PAD: f32 = 14.0;
-const INPUT_H: f32 = 36.0;
-const ADD_BTN_W: f32 = 82.0;
-const ADD_GAP: f32 = 10.0;
+const INPUT_PAD: f32 = 8.0;
+const INPUT_H: f32 = 30.0;
+const ADD_BTN_W: f32 = 72.0;
+const ADD_GAP: f32 = 8.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -88,7 +85,7 @@ enum Tab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     ToggleBypass,
-    SelectDoh(usize),
+    OpenDohMenu,
     SelectTab(Tab),
     RunTest,
     FocusInput,
@@ -105,15 +102,13 @@ struct UiState {
     fonts: FontSet,
     tab: Tab,
     hover: Option<Action>,
+    keyboard_focus: Option<Action>,
     tracking_mouse: bool,
     expanded: [bool; GROUPS.len()],
     scroll_steam: f32,
     scroll_custom: f32,
     max_scroll: f32,
     scroll_custom_to_bottom: bool,
-    toggle_t: f32,
-    spin_deg: f32,
-    anim_timer: bool,
     hits: Vec<(RectF, Action)>,
     row_targets: Vec<String>,
     taskbar_msg: u32,
@@ -135,15 +130,13 @@ impl UiState {
             fonts: FontSet::new(dpi),
             tab: Tab::Steam,
             hover: None,
+            keyboard_focus: None,
             tracking_mouse: false,
             expanded: [false; GROUPS.len()],
             scroll_steam: 0.0,
             scroll_custom: 0.0,
             max_scroll: 0.0,
             scroll_custom_to_bottom: false,
-            toggle_t: if on { 1.0 } else { 0.0 },
-            spin_deg: 0.0,
-            anim_timer: false,
             hits: Vec::with_capacity(36),
             row_targets: Vec::new(),
             taskbar_msg,
@@ -225,31 +218,25 @@ fn group_health(rows: &[&(String, Stat)], pending: usize) -> (Health, usize, usi
     (h, ok, fail, dns_fixed)
 }
 
-fn health_badge(h: Health) -> (&'static str, Color, Color) {
+fn health_label(h: Health) -> (&'static str, Color) {
     match h {
-        Health::Ok => ("Đã bypass", theme::success(), tint(theme::success())),
-        Health::Partial => ("Một phần", theme::warning(), tint(theme::warning())),
-        Health::Fail => ("Bị chặn", theme::danger(), tint(theme::danger())),
-        Health::Testing => ("Đang thử", theme::accent(), tint(theme::accent())),
-        Health::Idle => ("Chờ…", theme::neutral(), theme::neutral().with_alpha(30)),
+        Health::Ok => ("Đã bypass", theme::success()),
+        Health::Partial => ("Một phần", theme::danger()),
+        Health::Fail => ("Bị chặn", theme::danger()),
+        Health::Testing => ("Đang đo…", theme::info()),
+        Health::Idle => ("Chờ…", theme::text_dim()),
     }
 }
 
 fn host_dot_color(h: Health) -> Color {
-    match h {
-        Health::Ok => theme::success(),
-        Health::Partial => theme::warning(),
-        Health::Testing => theme::info(),
-        Health::Fail => theme::danger(),
-        Health::Idle => theme::neutral(),
-    }
+    health_label(h).1
 }
 
 fn latency_color(ms: u32) -> Color {
     if ms < 60 {
         theme::success()
     } else if ms <= 150 {
-        theme::warning()
+        theme::info()
     } else {
         theme::danger()
     }
@@ -271,19 +258,18 @@ fn avg_latency_ms(rows: &[&(String, Stat)]) -> Option<u32> {
     }
 }
 
-fn custom_input_rect(lw: f32) -> RectF {
-    let cw = (lw - PAD_X * 2.0).max(200.0);
-    let inner_x = PAD_X + INPUT_PAD;
-    let inner_w = (cw - INPUT_PAD * 2.0).max(160.0);
-    RectF::new(
-        inner_x,
-        CARD_Y + INPUT_PAD,
-        (inner_w - ADD_BTN_W - ADD_GAP).max(100.0),
-        INPUT_H,
-    )
+fn action_buttons(width: f32) -> (RectF, RectF) {
+    let y = TOOLBAR_Y + 8.0;
+    let test = RectF::new(width - PAD_X - 92.0, y, 92.0, 28.0);
+    let doh = RectF::new(test.x - 156.0, y, 148.0, test.h);
+    (doh, test)
 }
 
-// ---------------- Pure UI Rendering ----------------
+fn custom_input_rect(width: f32) -> RectF {
+    let x = PAD_X + INPUT_PAD;
+    RectF::new(x, CONTENT_Y + INPUT_PAD, width - x * 2.0 - ADD_BTN_W - ADD_GAP, INPUT_H)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_ui(
     hdc: HDC,
@@ -298,427 +284,206 @@ fn paint_ui(
     pending: usize,
 ) {
     let scale = state.dpi as f32 / 96.0;
-    let lw = (phys_w as f32 / scale).max(320.0);
-    let lh = (phys_h as f32 / scale).max(360.0);
+    let width = (phys_w as f32 / scale).max(MIN_W);
+    let height = (phys_h as f32 / scale).max(MIN_H);
     state.hits.clear();
     state.row_targets.clear();
 
     let mut c = Canvas::new(hdc, state.dpi);
+    c.fill_rect(RectF::new(0.0, 0.0, width, height), theme::bg());
 
-    // Window background (--color-background #0F172A)
-    c.fill_rect(RectF::new(0.0, 0.0, lw, lh), theme::bg());
+    let right = width - PAD_X;
+    c.draw_logo(PAD_X, 12.0, 26.0);
+    let title_x = PAD_X + 36.0;
+    let (title_w, _) = c.measure_text(APP_TITLE, state.fonts.title);
+    c.draw_text(APP_TITLE, RectF::new(title_x, 0.0, title_w + 4.0, HEADER_H),
+        state.fonts.title, theme::text(), DT_LEFT);
+    let (version_w, _) = c.measure_text(DISPLAY_VERSION, state.fonts.mono);
+    let version = RectF::new(title_x + title_w + 12.0, 15.0, version_w + 16.0, 20.0);
+    c.fill_round_rect(version, 10.0, theme::surface());
+    c.stroke_round_rect(version, 10.0, 1.0, theme::border_sub());
+    c.draw_text(DISPLAY_VERSION, version, state.fonts.mono, theme::text_sec(), DT_CENTER);
 
-    let cx = PAD_X;
-    let cw = (lw - PAD_X * 2.0).max(200.0);
+    let power = RectF::new(right - 99.0, 10.0, 99.0, 30.0);
+    paint_button(&mut c, &state.fonts, power, if on { "Tắt proxy" } else { "Bật proxy" },
+        !on, state.hover == Some(Action::ToggleBypass));
+    state.hits.push((power, Action::ToggleBypass));
 
-    // Precompute aggregate telemetry
-    let steam_rows: Vec<&(String, Stat)> = snap
-        .iter()
-        .filter(|(_, s)| s.group < CUSTOM_GROUP_IDX)
-        .collect();
-    let steam_ok = steam_rows
-        .iter()
-        .filter(|(_, s)| host_health(s, pending) == Health::Ok)
-        .count();
-    let steam_fail = steam_rows
-        .iter()
-        .filter(|(_, s)| host_health(s, pending) == Health::Fail)
-        .count();
+    let summary = RectF::new(PAD_X, HEADER_H, width - 2.0 * PAD_X, SUMMARY_H);
+    paint_connection_summary(&mut c, summary, &state.fonts, snap, on, pending);
+    paint_toolbar(&mut c, width, state, doh, pending);
 
-    let all_rows: Vec<&(String, Stat)> = snap.iter().collect();
-    let avg_ms = avg_latency_ms(&all_rows);
-    let total_ok = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Ok).count();
-    let total_fail = snap.iter().filter(|(_, s)| host_health(s, pending) == Health::Fail).count();
-    let dns_fixed_total = snap
-        .iter()
-        .filter(|(_, s)| matches!(s.dns, DnsState::Poisoned | DnsState::Failed))
-        .count();
-
-    // 1. Asymmetric Hero Bento Grid (Variance 8: 66% Control | 34% Live Latency Telemetry)
-    let bento_gap = 12.0;
-    let tele_w = ((cw - bento_gap) * 0.33).clamp(138.0, 168.0).round();
-    let ctrl_w = (cw - bento_gap - tele_w).max(220.0);
-    let hero_ctrl = RectF::new(cx, HERO_Y, ctrl_w, HERO_H);
-    let hero_tele = RectF::new(hero_ctrl.right() + bento_gap, HERO_Y, tele_w, HERO_H);
-
-    // 1a. Left Module — Primary Control Card
-    c.fill_round_rect(hero_ctrl, R_CARD, theme::surface());
-    let ctrl_border = if on {
-        Color::lerp(theme::border(), theme::accent(), 0.32)
-    } else {
-        theme::border()
-    };
-    c.stroke_round_rect(hero_ctrl, R_CARD, 1.0, ctrl_border);
-
-    // Scientific left-edge status rail (3px crisp vertical indicator)
-    let rail_col = if on { theme::accent() } else { theme::neutral() };
-    c.fill_round_rect(
-        RectF::new(hero_ctrl.x + 1.0, hero_ctrl.y + 14.0, 3.0, hero_ctrl.h - 28.0),
-        1.5,
-        rail_col,
-    );
-
-    // Logo
-    let lx = hero_ctrl.x + 16.0;
-    let ly = hero_ctrl.y + 24.0;
-    c.draw_logo(lx, ly, 40.0);
-
-    // Main Power Toggle Switch (right of control card)
-    let sw_w = 46.0;
-    let sw_h = 24.0;
-    let sw_x = hero_ctrl.right() - 16.0 - sw_w;
-    let sw_y = hero_ctrl.cy() - sw_h * 0.5;
-    let sw_rect = RectF::new(sw_x, sw_y, sw_w, sw_h);
-    let sw_hovered = state.hover == Some(Action::ToggleBypass);
-    let mut track = Color::lerp(theme::neutral(), theme::accent(), state.toggle_t);
-    if sw_hovered {
-        track = Color::lerp(track, WHITE, 0.12);
-    }
-    c.fill_round_rect(sw_rect, sw_h * 0.5, track);
-    let knob_x = sw_x + 12.0 + (sw_w - 24.0) * state.toggle_t;
-    c.fill_circle(knob_x, sw_y + 12.0, 9.0, WHITE);
-    state.hits.push((sw_rect.inset(-4.0, -6.0), Action::ToggleBypass));
-
-    // Title + compact status badge + clean subtitle
-    let tx = lx + 52.0;
-    let max_tx = sw_x - 12.0;
-    c.draw_text(
-        APP_TITLE,
-        RectF::new(tx, hero_ctrl.y + 16.0, (max_tx - tx).max(60.0), 22.0),
-        state.fonts.title,
-        theme::text(),
-        DT_LEFT,
-    );
-
-    let (st_label, st_col) = if on {
-        ("ĐANG BẬT · PROXY 127.0.0.1", theme::accent())
-    } else {
-        ("ĐÃ TẮT · KẾT NỐI TRỰC TIẾP", theme::text_muted())
-    };
-    let status_line = if on {
-        format!("ĐANG BẬT · :{PORT}")
-    } else {
-        st_label.to_string()
-    };
-    c.fill_circle(tx + 3.5, hero_ctrl.y + 46.0, 3.2, if on { theme::accent() } else { theme::neutral() });
-    c.draw_text(
-        &status_line,
-        RectF::new(tx + 12.0, hero_ctrl.y + 38.0, (max_tx - tx - 12.0).max(40.0), 16.0),
-        state.fonts.micro,
-        st_col,
-        DT_LEFT,
-    );
-
-    let (hero_sub, hero_sub_col) = if let Some((msg, col)) = &state.notice {
-        (msg.clone(), *col)
-    } else if pending > 0 {
-        ("Đang đo độ trễ & xác thực kết nối…".to_string(), theme::info())
-    } else if !on {
-        ("Không qua proxy · DoH tạm dừng".to_string(), theme::text_muted())
-    } else if direct_cdn {
-        (format!("DoH {} · CDN đi thẳng", doh.addr()), theme::text_muted())
-    } else {
-        (format!("DoH {} · Chia gói TLS", doh.addr()), theme::text_muted())
-    };
-    c.draw_text(
-        &hero_sub,
-        RectF::new(tx, hero_ctrl.y + 57.0, (max_tx - tx).max(40.0), 18.0),
-        state.fonts.caption,
-        hero_sub_col,
-        DT_LEFT,
-    );
-
-    // 1b. Right Module — Live Telemetry Readout Card
-    c.fill_round_rect(hero_tele, R_CARD, theme::surface());
-    c.stroke_round_rect(hero_tele, R_CARD, 1.0, theme::border());
-
-    c.draw_text(
-        "ĐỘ TRỄ TB",
-        RectF::new(hero_tele.x + 14.0, hero_tele.y + 12.0, hero_tele.w - 36.0, 14.0),
-        state.fonts.micro,
-        theme::text_muted(),
-        DT_LEFT,
-    );
-    let tele_dot = if !on {
-        theme::neutral()
-    } else if pending > 0 {
-        theme::info()
-    } else if let Some(ms) = avg_ms {
-        latency_color(ms)
-    } else {
-        theme::neutral()
-    };
-    c.fill_circle(hero_tele.right() - 16.0, hero_tele.y + 19.0, 3.5, tele_dot);
-
-    let (kpi_txt, kpi_col) = if !on {
-        ("— ms".to_string(), theme::text_dim())
-    } else if let Some(ms) = avg_ms {
-        (format!("{ms} ms"), latency_color(ms))
-    } else if pending > 0 {
-        ("… ms".to_string(), theme::info())
-    } else {
-        ("— ms".to_string(), theme::text_dim())
-    };
-    c.draw_text(
-        &kpi_txt,
-        RectF::new(hero_tele.x + 14.0, hero_tele.y + 30.0, hero_tele.w - 28.0, 28.0),
-        state.fonts.kpi,
-        kpi_col,
-        DT_LEFT,
-    );
-
-    let tele_sub = if !on {
-        "Tạm ngưng".to_string()
-    } else if total_fail > 0 {
-        format!("{total_ok}/{} OK · {total_fail} lỗi", snap.len())
-    } else if dns_fixed_total > 0 {
-        format!("{total_ok}/{} OK · {dns_fixed_total} DNS", snap.len())
-    } else {
-        format!("{total_ok}/{} máy chủ OK", snap.len())
-    };
-    c.draw_text(
-        &tele_sub,
-        RectF::new(hero_tele.x + 14.0, hero_tele.y + 62.0, hero_tele.w - 28.0, 16.0),
-        state.fonts.caption,
-        if total_fail > 0 && on { theme::warning() } else { theme::text_muted() },
-        DT_LEFT,
-    );
-
-    // 2. DoH Provider Selector Bar (4 Verified JSON DoH Resolvers)
-    let doh_bar = RectF::new(cx, DOH_Y, cw, DOH_H);
-    c.fill_round_rect(doh_bar, R_CARD, theme::surface());
-    c.stroke_round_rect(doh_bar, R_CARD, 1.0, theme::border());
-
-    let doh_cy = doh_bar.cy();
-    c.draw_dns_icon(doh_bar.x + 19.0, doh_cy, 5.8, theme::info());
-    c.draw_text(
-        "DoH",
-        RectF::new(doh_bar.x + 31.0, doh_bar.y, 34.0, doh_bar.h),
-        state.fonts.micro,
-        theme::text_muted(),
-        DT_LEFT,
-    );
-
-    let seg_left = doh_bar.x + 68.0;
-    let seg_right = doh_bar.right() - 8.0;
-    let seg_total_w = (seg_right - seg_left).max(160.0);
-    let pill_gap = 6.0;
-    let pill_w = (seg_total_w - pill_gap * (DohProvider::ALL.len() as f32 - 1.0))
-        / DohProvider::ALL.len() as f32;
-    let pill_h = 28.0;
-    let pill_y = doh_cy - pill_h * 0.5;
-
-    for (idx, &prov) in DohProvider::ALL.iter().enumerate() {
-        let px = seg_left + idx as f32 * (pill_w + pill_gap);
-        let pr = RectF::new(px, pill_y, pill_w, pill_h);
-        let active = prov == doh;
-        let hov = state.hover == Some(Action::SelectDoh(idx));
-        if active {
-            c.fill_round_rect(pr, R_SM, theme::primary());
-            c.stroke_round_rect(pr, R_SM, 1.0, theme::accent().with_alpha(190));
-        } else if hov {
-            c.fill_round_rect(pr, R_SM, theme::surface_hover());
-            c.stroke_round_rect(pr, R_SM, 1.0, theme::border());
-        } else {
-            c.fill_round_rect(pr, R_SM, theme::surface_inset());
-            c.stroke_round_rect(pr, R_SM, 1.0, theme::border_sub());
-        }
-
-        let lbl = if prov == DohProvider::Custom { "Custom…" } else { prov.label() };
-        let (lw_p, _) = c.measure_text(lbl, state.fonts.badge);
-        if active {
-            let dot_gap = 6.0;
-            let total_w = 6.0 + dot_gap + lw_p;
-            let sx = pr.x + ((pr.w - total_w) * 0.5).max(5.0);
-            c.fill_circle(sx + 2.5, pr.cy(), 2.8, theme::accent());
-            c.draw_text(
-                lbl,
-                RectF::new(sx + 6.0 + dot_gap - 1.0, pr.y, lw_p + 4.0, pr.h),
-                state.fonts.badge,
-                theme::text(),
-                DT_LEFT,
-            );
-        } else {
-            c.draw_text(
-                lbl,
-                pr,
-                state.fonts.caption,
-                if hov { theme::text_sec() } else { theme::text_muted() },
-                DT_CENTER,
-            );
-        }
-        state.hits.push((pr, Action::SelectDoh(idx)));
-    }
-
-    // 3. Segmented Tab Bar (Left) + "Kiểm tra" Button (Right)
-    let btn_w = 112.0;
-    let seg_w = cw - btn_w - 12.0;
-    let seg_rect = RectF::new(cx, NAV_Y, seg_w, NAV_H);
-    c.fill_round_rect(seg_rect, R_BTN, theme::surface());
-    c.stroke_round_rect(seg_rect, R_BTN, 1.0, theme::border());
-
-    let pad = 3.0;
-    let tab_w = (seg_w - pad * 2.0 - 4.0) / 3.0;
-    let tab_h = NAV_H - pad * 2.0;
-    let tab_steam_r = RectF::new(seg_rect.x + pad, seg_rect.y + pad, tab_w, tab_h);
-    let tab_custom_r = RectF::new(tab_steam_r.right() + 2.0, seg_rect.y + pad, tab_w, tab_h);
-
-    let steam_cnt = format!("{steam_ok}/{}", steam_rows.len());
-    let steam_cnt_col = if steam_fail > 0 && steam_ok == 0 {
-        theme::danger()
-    } else if steam_fail > 0 {
-        theme::warning()
-    } else if steam_ok > 0 {
-        theme::success()
-    } else {
-        theme::text_muted()
-    };
-    draw_tab(
-        &mut c,
-        &state.fonts,
-        tab_steam_r,
-        "Steam",
-        &steam_cnt,
-        steam_cnt_col,
-        state.tab == Tab::Steam,
-        state.hover == Some(Action::SelectTab(Tab::Steam)),
-    );
-    state.hits.push((tab_steam_r, Action::SelectTab(Tab::Steam)));
-
-    let enabled_custom = custom_list.iter().filter(|d| d.enabled).count();
-    let custom_cnt = if custom_list.is_empty() {
-        "0".to_string()
-    } else if enabled_custom == custom_list.len() {
-        format!("{}", custom_list.len())
-    } else {
-        format!("{enabled_custom}/{}", custom_list.len())
-    };
-    let custom_cnt_col = if enabled_custom == 0 { theme::text_muted() } else { theme::info() };
-    draw_tab(
-        &mut c,
-        &state.fonts,
-        tab_custom_r,
-        "Web khác",
-        &custom_cnt,
-        custom_cnt_col,
-        state.tab == Tab::Custom,
-        state.hover == Some(Action::SelectTab(Tab::Custom)),
-    );
-    state.hits.push((tab_custom_r, Action::SelectTab(Tab::Custom)));
-
-    let utilities = RectF::new(tab_custom_r.right() + 2.0, tab_custom_r.y, tab_w, tab_h);
-    let action = Action::SelectTab(Tab::Utilities);
-    draw_tab(&mut c, &state.fonts, utilities, "Tiện ích", "", theme::text_muted(),
-        state.tab == Tab::Utilities, state.hover == Some(action));
-    state.hits.push((utilities, action));
-
-    // "Kiểm tra" button (right)
-    let btn = RectF::new(cx + cw - btn_w, NAV_Y, btn_w, NAV_H);
-    let btn_hov = pending == 0 && state.hover == Some(Action::RunTest);
-    let btn_fill = if pending > 0 {
-        theme::surface_inset()
-    } else if btn_hov {
-        theme::primary_hover()
-    } else {
-        theme::btn_bg()
-    };
-    let btn_border = if btn_hov { theme::accent().with_alpha(150) } else { theme::border() };
-    c.fill_round_rect(btn, R_BTN, btn_fill);
-    c.stroke_round_rect(btn, R_BTN, 1.0, btn_border);
-
-    let (btn_txt, txt_col) = if pending > 0 {
-        ("Đang đo…", theme::text_muted())
-    } else {
-        ("Kiểm tra", theme::text())
-    };
-    let (btw, _) = c.measure_text(btn_txt, state.fonts.caption);
-    let icon_d = 11.0;
-    let gap = 7.0;
-    let start_x = btn.x + ((btn.w - (icon_d + gap + btw)) * 0.5).max(8.0);
-    let icon_cx = start_x + icon_d * 0.5;
-    let icon_cy = btn.cy();
-    if pending > 0 {
-        c.stroke_circle(icon_cx, icon_cy, 5.2, 1.6, theme::border());
-        c.draw_arc(icon_cx, icon_cy, 5.2, state.spin_deg, 240.0, 1.8, theme::info());
-    } else {
-        let ic_col = if btn_hov { theme::accent() } else { theme::text_sec() };
-        c.draw_arc(icon_cx, icon_cy, 5.0, -35.0, 275.0, 1.6, ic_col);
-        c.draw_line(icon_cx + 3.6, icon_cy - 5.0, icon_cx + 4.4, icon_cy - 2.2, 1.5, ic_col, true);
-        c.draw_line(icon_cx + 3.6, icon_cy - 5.0, icon_cx + 0.9, icon_cy - 3.5, 1.5, ic_col, true);
-        state.hits.push((btn, Action::RunTest));
-    }
-    c.draw_text(
-        btn_txt,
-        RectF::new(start_x + icon_d + gap, btn.y, btw + 4.0, btn.h),
-        state.fonts.caption,
-        txt_col,
-        DT_LEFT,
-    );
-
-    // 4. Main Content Card
-    let card_h = (lh - FOOTER_RESERVE - CARD_Y).max(180.0);
-    let card = RectF::new(cx, CARD_Y, cw, card_h);
-    c.fill_round_rect(card, R_CARD, theme::surface());
-    c.stroke_round_rect(card, R_CARD, 1.0, theme::border());
-
+    let footer_y = height - FOOTER_H;
+    let content = RectF::new(PAD_X, CONTENT_Y, width - 2.0 * PAD_X, footer_y - CONTENT_Y);
     match state.tab {
-        Tab::Steam => paint_steam_tab(&mut c, card, state, snap, direct_cdn, pending),
-        Tab::Custom => paint_custom_tab(&mut c, lw, card, state, snap, custom_list, pending),
-        Tab::Utilities => paint_utilities(&mut c, card, state, direct_cdn),
+        Tab::Steam => paint_steam_tab(&mut c, content, state, snap, direct_cdn, pending),
+        Tab::Custom => paint_custom_tab(&mut c, width, content, state, snap, custom_list, pending),
+        Tab::Utilities => paint_utilities(&mut c, content, state, direct_cdn),
     }
 
-    // 5. Clean Single-Line Footer
-    let foot_y = lh - 38.0;
-    let foot_h = 24.0;
-    let quit_w = 52.0;
-    let quit_h = 24.0;
-    let quit_rect = RectF::new(cx + cw - quit_w, foot_y, quit_w, quit_h);
-    let quit_hov = state.hover == Some(Action::QuitApp);
-    if quit_hov {
-        c.fill_round_rect(quit_rect, R_SM, DESTRUCTIVE.with_alpha(36));
+    c.draw_line(0.0, footer_y, width, footer_y, 1.0, theme::border_sub(), false);
+    let quit = RectF::new(right - 52.0, footer_y + 3.0, 52.0, FOOTER_H - 6.0);
+    let quit_hovered = state.hover == Some(Action::QuitApp);
+    if quit_hovered {
+        c.fill_round_rect(quit, R_SM, theme::surface_hover());
     }
-    c.draw_text(
-        "Thoát",
-        quit_rect,
-        state.fonts.caption,
-        if quit_hov { theme::danger() } else { theme::text_muted() },
-        DT_CENTER,
-    );
-    state.hits.push((quit_rect, Action::QuitApp));
+    c.draw_text("Thoát", quit, state.fonts.caption,
+        if quit_hovered { theme::danger() } else { theme::text_sec() }, DT_CENTER);
+    state.hits.push((quit, Action::QuitApp));
+    let (footer, color) = state.notice.as_ref()
+        .map(|(message, color)| (message.as_str(), *color))
+        .unwrap_or(("Đóng cửa sổ để ẩn vào khay", theme::text_muted()));
+    c.draw_text(footer, RectF::new(PAD_X, footer_y, quit.x - PAD_X - 8.0, FOOTER_H),
+        state.fonts.caption, color, DT_LEFT);
 
-    let hint = "Đóng (×) ẩn khay";
-    let (hint_w, _) = c.measure_text(hint, state.fonts.caption);
-    c.draw_text(
-        hint,
-        RectF::new(quit_rect.x - hint_w - 12.0, foot_y, hint_w + 4.0, foot_h),
-        state.fonts.caption,
-        theme::text_dim(),
-        DT_RIGHT,
-    );
+    if let Some(focus) = state.keyboard_focus {
+        if let Some((rect, _)) = state.hits.iter().find(|(_, action)| *action == focus) {
+            if focus != Action::FocusInput {
+                c.stroke_round_rect(rect.inset(1.0, 1.0), R_SM, 1.0, theme::text());
+            }
+        } else {
+            state.keyboard_focus = None;
+        }
+    }
+}
+
+fn paint_toolbar(c: &mut Canvas, width: f32, state: &mut UiState, doh: DohProvider, pending: usize) {
+
+    let sections = [(Tab::Steam, "Steam", 55.0), (Tab::Custom, "Web khác", 74.0), (Tab::Utilities, "Tiện ích", 66.0)];
+    let mut x = PAD_X;
+    for (tab, label, tab_w) in sections {
+        let rect = RectF::new(x, TOOLBAR_Y + 8.0, tab_w, 28.0);
+        let action = Action::SelectTab(tab);
+        let selected = state.tab == tab;
+        if selected {
+            c.fill_round_rect(rect, R_BTN, theme::surface());
+            c.stroke_round_rect(rect, R_BTN, 1.0, theme::border_sub());
+        } else if state.hover == Some(action) {
+            c.fill_round_rect(rect, R_BTN, theme::surface_hover());
+        }
+        c.draw_text(label, rect, state.fonts.body,
+            if selected { theme::info() } else { theme::text_sec() }, DT_CENTER);
+        state.hits.push((rect, action));
+        x += tab_w + 3.0;
+    }
+
+    let (doh_button, test_button) = action_buttons(width);
+    paint_button_frame(c, doh_button, false, state.hover == Some(Action::OpenDohMenu));
+    c.draw_text("DoH", RectF::new(doh_button.x + 9.0, doh_button.y, 29.0, doh_button.h),
+        state.fonts.micro, theme::text_muted(), DT_LEFT);
+    c.draw_line(doh_button.x + 37.0, doh_button.y + 7.0, doh_button.x + 37.0, doh_button.bottom() - 7.0,
+        1.0, theme::border(), false);
+    c.draw_text(doh.label(), RectF::new(doh_button.x + 46.0, doh_button.y, doh_button.w - 68.0, doh_button.h),
+        state.fonts.badge, theme::info(), DT_LEFT);
+    c.draw_chevron(doh_button.right() - 12.0, doh_button.cy(), 3.0, true, theme::text_sec());
+    state.hits.push((doh_button, Action::OpenDohMenu));
+
+    if pending > 0 {
+        paint_button_frame(c, test_button, false, false);
+        c.draw_text("Đang kiểm tra…", test_button, state.fonts.caption, theme::text_muted(), DT_CENTER);
+    } else {
+        paint_button(c, &state.fonts, test_button, "Kiểm tra", false, state.hover == Some(Action::RunTest));
+        state.hits.push((test_button, Action::RunTest));
+    }
+}
+
+fn paint_connection_summary(
+    c: &mut Canvas,
+    rect: RectF,
+    fonts: &FontSet,
+    snap: &[(String, Stat)],
+    on: bool,
+    pending: usize,
+) {
+    c.fill_round_rect(rect, R_PANEL, theme::surface());
+    c.stroke_round_rect(rect, R_PANEL, 1.0, theme::border_sub());
+    let cell_w = rect.w / 3.0;
+    let mut measured = 0u64;
+    let mut latency_sum = 0u64;
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut dns_fixed = 0usize;
+    for (_, stat) in snap {
+        if let Some(ms) = stat.latency_ms {
+            latency_sum += u64::from(ms);
+            measured += 1;
+        }
+        match host_health(stat, pending) {
+            Health::Ok => ok += 1,
+            Health::Fail => fail += 1,
+            _ => {}
+        }
+        if matches!(stat.dns, DnsState::Poisoned | DnsState::Failed) {
+            dns_fixed += 1;
+        }
+    }
+
+    let proxy_label = format!("PROXY · :{PORT}");
+    let (latency, latency_ink) = if on && measured > 0 {
+        let ms = ((latency_sum + measured / 2) / measured) as u32;
+        (format!("{ms} ms"), latency_color(ms))
+    } else {
+        ("— ms".into(), theme::text_muted())
+    };
+    let (hosts, host_ink) = if !on {
+        ("Tạm ngưng".into(), theme::text_muted())
+    } else if pending > 0 {
+        ("Đang đo…".into(), theme::info())
+    } else if fail > 0 {
+        (format!("{ok}/{} · {fail} lỗi", snap.len()), theme::danger())
+    } else if dns_fixed > 0 {
+        (format!("{ok}/{} · {dns_fixed} DNS", snap.len()), theme::success())
+    } else {
+        (format!("{ok}/{} OK", snap.len()), if ok > 0 { theme::success() } else { theme::text_muted() })
+    };
+
+    let entries = [
+        (&*proxy_label, if on { "Đang bật" } else { "Đã tắt" },
+            if on { theme::success() } else { theme::text_muted() }, fonts.group),
+        ("ĐỘ TRỄ TB", &latency, latency_ink, fonts.kpi),
+        ("MÁY CHỦ", &hosts, host_ink, fonts.mono_bold),
+    ];
+    for (index, (label, value, ink, font)) in entries.into_iter().enumerate() {
+        let x = rect.x + index as f32 * cell_w;
+        if index > 0 {
+            c.draw_line(x, rect.y + 10.0, x, rect.bottom() - 10.0, 1.0, theme::border_sub(), false);
+        }
+        let text_x = x + 12.0;
+        c.draw_text(label, RectF::new(text_x, rect.y + 5.0, cell_w - 19.0, 16.0),
+            fonts.micro, theme::text_muted(), DT_LEFT);
+        c.draw_text(value, RectF::new(text_x, rect.y + 22.0, cell_w - 19.0, 25.0), font, ink, DT_LEFT);
+    }
 }
 
 fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: bool) {
     state.max_scroll = 0.0;
     let fonts = &state.fonts;
-    let row_x = card.x + 12.0;
-    let row_w = card.w - 24.0;
     let rows = [
-        ("Đi thẳng CDN tải game", "Dùng kết nối trực tiếp để tải game.", ID_MENU_DIRECT_CDN),
+        ("Đi thẳng CDN tải game", "Tận dụng cache nội mạng.", ID_MENU_DIRECT_CDN),
         ("Khởi chạy cùng Windows", "Mở ứng dụng trong khay khi đăng nhập.", ID_MENU_AUTOSTART),
-        ("Giao diện", "Chọn màu hiển thị của ứng dụng.", 0),
-        ("Cập nhật", concat!("Phiên bản đang dùng: ", env!("CARGO_PKG_VERSION")), ID_UPDATE),
+        ("Giao diện", "", 0),
+        ("Cập nhật", DISPLAY_VERSION, ID_UPDATE),
     ];
 
+    let panel = RectF::new(card.x, card.y, card.w, rows.len() as f32 * UTILITY_ROW_H + 10.0);
+    c.fill_round_rect(panel, R_PANEL, theme::surface_inset());
+    c.stroke_round_rect(panel, R_PANEL, 1.0, theme::border_sub());
+
     for (index, (title, description, command)) in rows.into_iter().enumerate() {
-        let row = RectF::new(row_x, card.y + 12.0 + index as f32 * 58.0, row_w, 54.0);
+        let row = RectF::new(panel.x + 10.0, panel.y + 5.0 + index as f32 * UTILITY_ROW_H, panel.w - 20.0, UTILITY_ROW_H);
         let action = Action::Utility(command);
         let is_switch = index < 2;
         let hovered = state.hover == Some(action);
-        c.fill_round_rect(row, R_SM, if is_switch && hovered { theme::surface_hover() } else { theme::surface_inset() });
-        c.stroke_round_rect(row, R_SM, 1.0, theme::border_sub());
+        if is_switch && hovered {
+            c.fill_round_rect(row.inset(0.0, 2.0), R_SM, theme::surface_hover());
+        }
+        if index > 0 {
+            c.draw_line(row.x, row.y, row.right(), row.y, 1.0, theme::border_sub(), false);
+        }
         let caption_w = if is_switch { row.w - 113.0 } else { row.w - 148.0 };
-        c.draw_text(title, RectF::new(row.x + 12.0, row.y + 7.0, caption_w, 19.0), fonts.group, theme::text(), DT_LEFT);
-        c.draw_text(description, RectF::new(row.x + 12.0, row.y + 27.0, caption_w, 18.0), fonts.caption, theme::text_muted(), DT_LEFT);
+        let title_y = if description.is_empty() { row.cy() - 9.5 } else { row.y + 3.0 };
+        c.draw_text(title, RectF::new(row.x + 4.0, title_y, caption_w, 19.0), fonts.group, theme::text(), DT_LEFT);
+        c.draw_text(description, RectF::new(row.x + 4.0, row.y + 20.0, caption_w, 17.0), fonts.caption, theme::text_muted(), DT_LEFT);
 
         let controls_x = row.right() - 126.0;
         if is_switch {
@@ -729,8 +494,8 @@ fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: boo
             state.hits.push((row, action));
         } else if command == ID_UPDATE {
             let busy = state.update.is_some();
-            let button = RectF::new(controls_x, row.cy() - 15.0, 114.0, 30.0);
-            paint_utility_button(c, fonts, button, if busy { "Đang kiểm tra…" } else { "Kiểm tra cập nhật" },
+            let button = RectF::new(controls_x, row.cy() - 15.0, 116.0, 30.0);
+            paint_button(c, fonts, button, if busy { "Đang kiểm tra…" } else { "Kiểm tra cập nhật" },
                 false, hovered && !busy);
             if !busy { state.hits.push((button, action)); }
         } else {
@@ -738,72 +503,41 @@ fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: boo
             for (offset, label, cmd, active) in [(0.0, "Sáng", ID_LIGHT, light), (58.0, "Tối", ID_DARK, !light)] {
                 let button = RectF::new(controls_x + offset, row.cy() - 15.0, 56.0, 30.0);
                 let action = Action::Utility(cmd);
-                paint_utility_button(c, fonts, button, label, active, state.hover == Some(action));
+                paint_button(c, fonts, button, label, active, state.hover == Some(action));
                 state.hits.push((button, action));
             }
         }
     }
 }
 
-fn paint_utility_button(c: &mut Canvas, fonts: &FontSet, rect: RectF, label: &str, active: bool, hovered: bool) {
-    let fill = if active { theme::primary() } else if hovered { theme::surface_hover() } else { theme::btn_bg() };
-    c.fill_round_rect(rect, R_SM, fill);
-    c.stroke_round_rect(rect, R_SM, 1.0, if active { theme::accent() } else { theme::border() });
-    let label_rect = if active && rect.w <= 56.0 {
-        c.draw_checkmark(rect.x + 11.0, rect.cy(), 7.0, 1.5, theme::accent());
-        RectF::new(rect.x + 16.0, rect.y, rect.w - 20.0, rect.h)
-    } else {
-        rect
+fn paint_button_frame(c: &mut Canvas, rect: RectF, primary: bool, hovered: bool) {
+    let (fill, border) = match (primary, hovered) {
+        (true, true) => (theme::primary_hover(), theme::primary_hover()),
+        (true, false) => (theme::primary(), theme::primary()),
+        (false, true) => (theme::surface_hover(), theme::text_dim()),
+        (false, false) => (theme::surface_inset(), theme::border()),
     };
-    c.draw_text(label, label_rect, fonts.badge, theme::text(), DT_CENTER);
+    c.fill_round_rect(rect, R_BTN, fill);
+    c.stroke_round_rect(rect, R_BTN, 1.0, border);
+}
+
+fn paint_button(c: &mut Canvas, fonts: &FontSet, rect: RectF, label: &str, primary: bool, hovered: bool) {
+    paint_button_frame(c, rect, primary, hovered);
+    c.draw_text(label, rect, fonts.badge,
+        if primary { theme::on_primary() } else { theme::text() }, DT_CENTER);
 }
 
 fn draw_mini_toggle(c: &mut Canvas, r: RectF, on: bool, hovered: bool) {
-    let mut track = if on { theme::accent() } else { theme::neutral() };
-    if hovered {
-        track = Color::lerp(track, WHITE, 0.14);
-    }
+    let track = match (on, hovered) {
+        (true, true) => theme::primary_hover(),
+        (true, false) => theme::primary(),
+        (false, true) => theme::text_dim(),
+        (false, false) => theme::neutral(),
+    };
     c.fill_round_rect(r, r.h * 0.5, track);
-    let rad = r.h * 0.5 - 2.5;
-    let kx = if on { r.right() - r.h * 0.5 } else { r.x + r.h * 0.5 };
-    c.fill_circle(kx, r.cy(), rad, WHITE);
-}
-
-fn draw_tab(
-    c: &mut Canvas,
-    fonts: &FontSet,
-    r: RectF,
-    label: &str,
-    count: &str,
-    count_col: Color,
-    active: bool,
-    hovered: bool,
-) {
-    if active {
-        c.fill_round_rect(r, R_SM, theme::surface_elev());
-        c.stroke_round_rect(r, R_SM, 1.0, theme::border());
-    } else if hovered {
-        c.fill_round_rect(r, R_SM, theme::surface_hover());
-    }
-    let (lw, _) = c.measure_text(label, fonts.badge);
-    let (cw, _) = c.measure_text(count, fonts.mono);
-    let gap = 6.0;
-    let total = if count.is_empty() { lw } else { lw + gap + cw };
-    let sx = r.x + ((r.w - total) * 0.5).max(6.0);
-    c.draw_text(
-        label,
-        RectF::new(sx, r.y, lw + 4.0, r.h),
-        fonts.badge,
-        if active { theme::text() } else if hovered { theme::text_sec() } else { theme::text_muted() },
-        DT_LEFT,
-    );
-    c.draw_text(
-        count,
-        RectF::new(sx + lw + gap, r.y, cw + 4.0, r.h),
-        fonts.mono,
-        count_col,
-        DT_LEFT,
-    );
+    let radius = r.h * 0.5 - 2.5;
+    let knob_x = if on { r.right() - r.h * 0.5 } else { r.x + r.h * 0.5 };
+    c.fill_circle(knob_x, r.cy(), radius, if on { theme::on_primary() } else { theme::switch_thumb() });
 }
 
 fn paint_steam_tab(
@@ -814,7 +548,7 @@ fn paint_steam_tab(
     direct_cdn: bool,
     pending: usize,
 ) {
-    let inner = RectF::new(card.x + 1.0, card.y + 4.0, card.w - 2.0, card.h - 8.0);
+    const HEAD_H: f32 = 28.0;
     let visible_groups: Vec<(usize, Vec<&(String, Stat)>)> = (0..CUSTOM_GROUP_IDX)
         .filter_map(|gi| {
             let rows: Vec<&(String, Stat)> = snap.iter().filter(|(_, s)| s.group == gi).collect();
@@ -822,18 +556,38 @@ fn paint_steam_tab(
         })
         .collect();
 
-    const GROUP_H: f32 = 58.0;
-    const HOST_H: f32 = 36.0;
+    const GROUP_H: f32 = 39.0;
+    const HOST_H: f32 = 38.0;
     let content_h: f32 = visible_groups
         .iter()
         .map(|(gi, rows)| {
             GROUP_H + if state.expanded[*gi] { rows.len() as f32 * HOST_H } else { 0.0 }
         })
         .sum();
+    let table_h = if visible_groups.is_empty() { card.h } else { (HEAD_H + content_h + 2.0).min(card.h) };
+    let table = RectF::new(card.x, card.y, card.w, table_h);
+    let inner = RectF::new(table.x + 1.0, table.y + HEAD_H, table.w - 2.0, table.h - HEAD_H - 2.0);
+    c.fill_round_rect(table, R_PANEL, theme::surface_inset());
+    c.stroke_round_rect(table, R_PANEL, 1.0, theme::border_sub());
     state.max_scroll = (content_h - inner.h).max(0.0);
     state.scroll_steam = state.scroll_steam.clamp(0.0, state.max_scroll);
 
     let scroll_pad = if state.max_scroll > 0.5 { 8.0 } else { 0.0 };
+    let right = inner.right() - 10.0 - scroll_pad;
+    let status = RectF::new(right - 82.0, card.y, 82.0, HEAD_H);
+    let replies = RectF::new(status.x - 78.0, card.y, 66.0, HEAD_H);
+    let latency = RectF::new(replies.x - 80.0, card.y, 64.0, HEAD_H);
+    let details = RectF::new(inner.x + 28.0, card.y, latency.x - 38.0 - inner.x, HEAD_H);
+    c.draw_text("DỊCH VỤ", details, state.fonts.micro, theme::text_muted(), DT_LEFT);
+    for (label, column) in [("ĐỘ TRỄ", latency), ("PHẢN HỒI", replies), ("TRẠNG THÁI", status)] {
+        c.draw_text(label, column, state.fonts.micro, theme::text_muted(), DT_RIGHT);
+    }
+    c.draw_line(inner.x, inner.y, inner.right(), inner.y, 1.0, theme::border_sub(), false);
+
+    if visible_groups.is_empty() {
+        c.draw_text("Chưa có dữ liệu · Bấm Kiểm tra để đo kết nối", inner, state.fonts.body,
+            theme::text_muted(), DT_CENTER);
+    }
     c.set_clip(Some(inner));
 
     let mut y = inner.y - state.scroll_steam;
@@ -854,12 +608,8 @@ fn paint_steam_tab(
         let is_exp = state.expanded[*gi];
         let is_hov = state.hover == Some(Action::ToggleGroup(*gi));
         if gh_rect.bottom() > inner.y && gh_rect.y < inner.bottom() {
-            if is_hov {
-                c.fill_round_rect(
-                    RectF::new(inner.x + 8.0, y + 3.0, inner.w - 16.0 - scroll_pad, GROUP_H - 6.0),
-                    R_SM,
-                    theme::surface_hover(),
-                );
+            if is_hov || is_exp {
+                c.fill_rect(gh_rect, if is_hov { theme::surface_hover() } else { theme::surface() });
             }
             let hit_top = gh_rect.y.max(inner.y);
             let hit_bot = gh_rect.bottom().min(inner.bottom());
@@ -871,81 +621,42 @@ fn paint_steam_tab(
             }
 
             let is_direct_cdn = *gi == CDN_GROUP_IDX && direct_cdn;
-            let (gh, ok_c, _fail_c, dns_fixed) = group_health(rows, pending);
-            let grp_ms = avg_latency_ms(rows);
-            let dot_c = if is_direct_cdn { theme::info() } else { host_dot_color(gh) };
-            let gcy = y + GROUP_H * 0.5;
-            let gx = inner.x + 16.0;
-
-            c.draw_chevron(gx + 4.0, gcy, 3.5, is_exp, theme::text_muted());
-            if is_direct_cdn {
-                c.fill_circle(gx + 20.0, gcy, 7.0, theme::info().with_alpha(34));
-            } else if gh == Health::Ok {
-                c.fill_circle(gx + 20.0, gcy, 7.0, theme::success().with_alpha(34));
-            }
-            c.fill_circle(gx + 20.0, gcy, 3.8, dot_c);
-
-            let (blabel, bfg, bbg) = if is_direct_cdn {
-                ("Đi thẳng", theme::info(), tint(theme::info()))
+            let (health, ok, _, dns_fixed) = group_health(rows, pending);
+            let (label, ink) = if is_direct_cdn {
+                ("Đi thẳng", theme::info())
             } else {
-                health_badge(gh)
+                health_label(health)
             };
-            // Fixed scientific column widths so status badge, fraction, and latency pills align vertically
-            let badge_col_w = 78.0;
-            let badge_r = RectF::new(
-                inner.right() - 16.0 - scroll_pad - badge_col_w,
-                gcy - 10.5,
-                badge_col_w,
-                21.0,
-            );
-            c.fill_round_rect(badge_r, 10.5, bbg);
-            c.draw_text(blabel, badge_r, state.fonts.badge, bfg, DT_CENTER);
+            let mid_y = y + GROUP_H * 0.5;
+            c.draw_chevron(inner.x + 13.0, mid_y, 3.5, is_exp, theme::text_muted());
 
-            let frac_col_w = 26.0;
-            let frac_r = RectF::new(badge_r.x - 10.0 - frac_col_w, y, frac_col_w, GROUP_H);
-            let frac = format!("{ok_c}/{}", rows.len());
-            c.draw_text(&frac, frac_r, state.fonts.mono, theme::text_dim(), DT_RIGHT);
-
-            let mut right_edge = frac_r.x - 10.0;
-
-            // Scientific tabular latency pill (fixed min width for crisp column alignment)
-            if let Some(ms) = grp_ms {
-                let lat_txt = format!("{ms}ms");
-                let lcol = latency_color(ms);
-                let (ltw, _) = c.measure_text(&lat_txt, state.fonts.mono_bold);
-                let lat_w = (ltw + 12.0).ceil().max(44.0);
-                let lat_h = 20.0;
-                let lat_r = RectF::new(right_edge - lat_w, gcy - lat_h * 0.5, lat_w, lat_h);
-                c.fill_round_rect(lat_r, R_SM, theme::surface_inset());
-                c.stroke_round_rect(lat_r, R_SM, 1.0, lcol.with_alpha(70));
-                c.draw_text(&lat_txt, lat_r, state.fonts.mono_bold, lcol, DT_CENTER);
-                right_edge = lat_r.x - 10.0;
+            let row_cell = |column: RectF| RectF::new(column.x, y, column.w, GROUP_H);
+            if let Some(ms) = avg_latency_ms(rows) {
+                c.draw_text(&format!("{ms} ms"), row_cell(latency),
+                    state.fonts.mono_bold, latency_color(ms), DT_RIGHT);
+            } else {
+                c.draw_text("—", row_cell(latency), state.fonts.mono, theme::text_muted(), DT_RIGHT);
             }
+            c.draw_text(&format!("{ok}/{}", rows.len()), row_cell(replies),
+                state.fonts.mono, theme::text_sec(), DT_RIGHT);
+            let (label_w, _) = c.measure_text(label, state.fonts.badge);
+            let status_w = (label_w + 16.0).min(status.w);
+            let badge = RectF::new(status.right() - status_w, mid_y - 10.0, status_w, 20.0);
+            c.fill_round_rect(badge, 10.0, theme::surface_hover());
+            c.draw_text(label, badge, state.fonts.badge, ink, DT_CENTER);
 
-            let text_left = gx + 34.0;
-            let text_right = right_edge.max(text_left + 50.0);
-            let (gname, gdesc) = GROUPS[*gi];
-            c.draw_text(
-                gname,
-                RectF::new(text_left, y + 10.0, text_right - text_left, 20.0),
-                state.fonts.group,
-                theme::text(),
-                DT_LEFT,
-            );
-            let sub = if is_direct_cdn {
-                "Kết nối trực tiếp · Giữ max tốc độ tải game".to_string()
+            let (name, description) = GROUPS[*gi];
+            let subtitle = if is_direct_cdn {
+                "Kết nối trực tiếp để tải game".into()
             } else if dns_fixed {
-                format!("{gdesc} · DNS đã sửa")
+                format!("DNS sửa · {description}")
             } else {
-                gdesc.to_string()
+                description.to_owned()
             };
-            c.draw_text(
-                &sub,
-                RectF::new(text_left, y + 31.0, text_right - text_left, 17.0),
-                state.fonts.caption,
-                theme::text_muted(),
-                DT_LEFT,
-            );
+            c.draw_text(name, RectF::new(details.x, y + 2.0, details.w, 19.0),
+                state.fonts.group, theme::text(), DT_LEFT);
+            c.draw_text(&subtitle, RectF::new(details.x, y + 20.0, details.w, 16.0),
+                state.fonts.caption, theme::text_muted(), DT_LEFT);
         }
         y += GROUP_H;
 
@@ -970,85 +681,30 @@ fn paint_steam_tab(
                             false,
                         );
                     }
-                    let hcy = y + HOST_H * 0.5;
-                    let hh = host_health(s, pending);
-                    c.fill_circle(inner.x + 28.0, hcy, 3.0, host_dot_color(hh));
+                    let text_x = inner.x + 35.0;
+                    let text_right = inner.right() - 16.0 - scroll_pad;
+                    c.fill_circle(inner.x + 25.0, y + 11.0, 3.0, host_dot_color(host_health(s, pending)));
 
-                    let mut rx = inner.right() - 16.0 - scroll_pad;
-                    if s.ok > 0 {
-                        let cnt = format!("×{}", s.ok);
-                        let (cw_txt, _) = c.measure_text(&cnt, state.fonts.caption);
-                        c.draw_text(
-                            &cnt,
-                            RectF::new(rx - cw_txt - 2.0, y, cw_txt + 2.0, HOST_H),
-                            state.fonts.caption,
-                            theme::text_dim(),
-                            DT_RIGHT,
-                        );
-                        rx -= cw_txt + 8.0;
-                    }
-
-                    // Per-host ping latency
+                    let mut host_right = text_right;
                     if let Some(ms) = s.latency_ms {
-                        let lat = format!("{ms}ms");
-                        let (lw_m, _) = c.measure_text(&lat, state.fonts.mono_bold);
-                        c.draw_text(
-                            &lat,
-                            RectF::new(rx - lw_m - 2.0, y, lw_m + 2.0, HOST_H),
-                            state.fonts.mono_bold,
-                            latency_color(ms),
-                            DT_RIGHT,
-                        );
-                        rx -= lw_m + 10.0;
+                        let latency = format!("{ms}ms");
+                        let (width, _) = c.measure_text(&latency, state.fonts.mono_bold);
+                        c.draw_text(&latency, RectF::new(text_right - width - 2.0, y + 2.0, width + 2.0, 18.0),
+                            state.fonts.mono_bold, latency_color(ms), DT_RIGHT);
+                        host_right -= width + 10.0;
                     }
+                    c.draw_text(host, RectF::new(text_x, y + 2.0, host_right - text_x, 18.0),
+                        state.fonts.body, theme::text_sec(), DT_LEFT);
 
+                    let (dns, dns_color) = match s.dns {
+                        DnsState::Poisoned | DnsState::Failed => (" · DNS sửa", theme::info()),
+                        DnsState::Clean => (" · DNS OK", theme::text_muted()),
+                        DnsState::Unknown => ("", theme::text_muted()),
+                    };
                     let ip = if s.ip.is_empty() { "—" } else { &s.ip };
-                    let (ip_w, _) = c.measure_text(ip, state.fonts.mono);
-                    c.draw_text(
-                        ip,
-                        RectF::new(rx - ip_w - 2.0, y, ip_w + 2.0, HOST_H),
-                        state.fonts.mono,
-                        theme::text_muted(),
-                        DT_RIGHT,
-                    );
-                    rx -= ip_w + 10.0;
-
-                    match s.dns {
-                        DnsState::Poisoned | DnsState::Failed => {
-                            let tag = "DNS sửa";
-                            let (tw, _) = c.measure_text(tag, state.fonts.badge);
-                            c.draw_text(
-                                tag,
-                                RectF::new(rx - tw - 2.0, y, tw + 2.0, HOST_H),
-                                state.fonts.badge,
-                                theme::warning(),
-                                DT_RIGHT,
-                            );
-                            rx -= tw + 8.0;
-                        }
-                        DnsState::Clean => {
-                            let tag = "DNS OK";
-                            let (tw, _) = c.measure_text(tag, state.fonts.caption);
-                            c.draw_text(
-                                tag,
-                                RectF::new(rx - tw - 2.0, y, tw + 2.0, HOST_H),
-                                state.fonts.caption,
-                                theme::text_dim(),
-                                DT_RIGHT,
-                            );
-                            rx -= tw + 8.0;
-                        }
-                        DnsState::Unknown => {}
-                    }
-
-                    let host_left = inner.x + 40.0;
-                    c.draw_text(
-                        host,
-                        RectF::new(host_left, y, (rx - host_left - 8.0).max(40.0), HOST_H),
-                        state.fonts.body,
-                        theme::text_sec(),
-                        DT_LEFT,
-                    );
+                    let details = if s.ok > 0 { format!("{ip}{dns} · ×{}", s.ok) } else { format!("{ip}{dns}") };
+                    c.draw_text(&details, RectF::new(text_x, y + 20.0, text_right - text_x, 15.0),
+                        state.fonts.caption, dns_color, DT_LEFT);
                 }
                 y += HOST_H;
             }
@@ -1069,13 +725,16 @@ fn paint_custom_tab(
     custom_list: &[CustomDomain],
     pending: usize,
 ) {
-    // Top fixed input bar inside card (NO 1-click presets strip)
+    c.fill_round_rect(card, R_PANEL, theme::surface_inset());
+    c.stroke_round_rect(card, R_PANEL, 1.0, theme::border_sub());
+
+    // Domain input stays above the scrollable list.
     let inp = custom_input_rect(lw);
     let inp_hov = state.hover == Some(Action::FocusInput);
     let inp_border = if state.edit_focused {
-        theme::accent()
+        theme::text()
     } else if inp_hov {
-        Color::lerp(theme::border(), theme::accent(), 0.45)
+        theme::text_dim()
     } else {
         theme::border()
     };
@@ -1083,7 +742,7 @@ fn paint_custom_tab(
     c.stroke_round_rect(inp, R_BTN, if state.edit_focused { 1.4 } else { 1.0 }, inp_border);
     if !state.edit_focused && !state.edit_has_text {
         c.draw_text(
-            "Nhập hoặc dán tên miền (vd: bbc.com, medium.com)…",
+            "Nhập hoặc dán tên miền…",
             RectF::new(inp.x + 12.0, inp.y, (inp.w - 22.0).max(40.0), inp.h),
             state.fonts.caption,
             theme::text_dim(),
@@ -1092,34 +751,20 @@ fn paint_custom_tab(
     }
     state.hits.push((inp, Action::FocusInput));
 
-    // Primary CTA button matching MASTER.md (.btn-primary: #22C55E bg, #0F172A fg)
-    let add_btn = RectF::new(inp.right() + ADD_GAP, inp.y, ADD_BTN_W, INPUT_H);
-    let add_hov = state.hover == Some(Action::AddDomain);
-    c.fill_round_rect(add_btn, R_BTN, if add_hov { theme::accent_hover() } else { theme::accent() });
-    let add_label = "Thêm";
-    let (alw, _) = c.measure_text(add_label, state.fonts.badge);
-    let plus_w = 10.0;
-    let add_gap = 6.0;
-    let add_sx = add_btn.x + ((add_btn.w - (plus_w + add_gap + alw)) * 0.5).max(8.0);
-    c.draw_plus(add_sx + plus_w * 0.5, add_btn.cy(), 4.2, 1.8, theme::on_accent());
-    c.draw_text(
-        add_label,
-        RectF::new(add_sx + plus_w + add_gap, add_btn.y, alw + 4.0, add_btn.h),
-        state.fonts.badge,
-        theme::on_accent(),
-        DT_LEFT,
-    );
-    state.hits.push((add_btn, Action::AddDomain));
+    let add_button = RectF::new(inp.right() + ADD_GAP, inp.y, ADD_BTN_W, INPUT_H);
+    let add_hovered = state.hover == Some(Action::AddDomain);
+    paint_button(c, &state.fonts, add_button, "Thêm", true, add_hovered);
+    state.hits.push((add_button, Action::AddDomain));
 
-    let div_y = inp.bottom() + 14.0;
+    let div_y = inp.bottom() + INPUT_PAD;
     c.draw_line(card.x + 1.0, div_y, card.right() - 1.0, div_y, 1.0, theme::border_sub(), false);
 
     // Bottom fixed informational note inside card
-    let info_h = 30.0;
+    let info_h = 24.0;
     let info_y = card.bottom() - info_h - 1.0;
     c.draw_line(card.x + 1.0, info_y, card.right() - 1.0, info_y, 1.0, theme::border_sub(), false);
     c.draw_text(
-        "Chỉ vượt chặn DNS/DPI nhà mạng · Web tự chặn IP (403/WAF) cần VPN",
+        "Vượt chặn DNS/DPI. Trang chặn IP có thể cần VPN.",
         RectF::new(card.x + 14.0, info_y, card.w - 28.0, info_h),
         state.fonts.caption,
         theme::text_dim(),
@@ -1159,7 +804,8 @@ fn paint_custom_tab(
         return;
     }
 
-    const ROW_H: f32 = 58.0;
+    state.row_targets.extend(custom_list.iter().map(|item| item.domain.clone()));
+    const ROW_H: f32 = 42.0;
     let content_h = custom_list.len() as f32 * ROW_H;
     state.max_scroll = (content_h - list_r.h).max(0.0);
     if state.scroll_custom_to_bottom {
@@ -1236,13 +882,7 @@ fn paint_custom_tab(
 
             let rcy = y + ROW_H * 0.5;
             let dot_x = list_r.x + 20.0;
-            if item.enabled && h == Health::Ok {
-                c.fill_circle(dot_x, rcy, 7.0, theme::success().with_alpha(34));
-            }
             c.fill_circle(dot_x, rcy, 3.8, host_dot_color(h));
-
-            let target_idx = state.row_targets.len();
-            state.row_targets.push(root.clone());
 
             // Right-most delete button (×)
             let del_sz = 26.0;
@@ -1252,9 +892,9 @@ fn paint_custom_tab(
                 del_sz,
                 del_sz,
             );
-            let del_hov = state.hover == Some(Action::RemoveDomain(target_idx));
+            let del_hov = state.hover == Some(Action::RemoveDomain(idx));
             if del_hov {
-                c.fill_round_rect(del_r, R_SM, DESTRUCTIVE.with_alpha(40));
+                c.fill_round_rect(del_r, R_SM, theme::surface_hover());
             }
             c.draw_cross(
                 del_r.x + del_sz * 0.5,
@@ -1263,27 +903,27 @@ fn paint_custom_tab(
                 1.6,
                 if del_hov { theme::danger() } else { theme::text_dim() },
             );
-            let ht = del_r.y.max(list_r.y);
-            let hb = del_r.bottom().min(list_r.bottom());
-            if hb > ht {
-                state.hits.push((
-                    RectF::new(del_r.x, ht, del_r.w, hb - ht),
-                    Action::RemoveDomain(target_idx),
-                ));
-            }
-
             // Mini pause/resume toggle left of delete button
             let tg_w = 34.0;
             let tg_h = 18.0;
             let tg_r = RectF::new(del_r.x - 10.0 - tg_w, rcy - tg_h * 0.5, tg_w, tg_h);
-            let tg_hov = state.hover == Some(Action::ToggleCustomDomain(target_idx));
+            let tg_hov = state.hover == Some(Action::ToggleCustomDomain(idx));
             draw_mini_toggle(c, tg_r, item.enabled, tg_hov);
             let tht = (tg_r.y - 4.0).max(list_r.y);
             let thb = (tg_r.bottom() + 4.0).min(list_r.bottom());
             if thb > tht {
                 state.hits.push((
                     RectF::new(tg_r.x - 3.0, tht, tg_r.w + 6.0, thb - tht),
-                    Action::ToggleCustomDomain(target_idx),
+                    Action::ToggleCustomDomain(idx),
+                ));
+            }
+
+            let ht = del_r.y.max(list_r.y);
+            let hb = del_r.bottom().min(list_r.bottom());
+            if hb > ht {
+                state.hits.push((
+                    RectF::new(del_r.x, ht, del_r.w, hb - ht),
+                    Action::RemoveDomain(idx),
                 ));
             }
 
@@ -1298,7 +938,7 @@ fn paint_custom_tab(
                     let lat_h = 20.0;
                     let lat_r = RectF::new(right_limit - lat_w, rcy - lat_h * 0.5, lat_w, lat_h);
                     c.fill_round_rect(lat_r, R_SM, theme::surface_inset());
-                    c.stroke_round_rect(lat_r, R_SM, 1.0, lcol.with_alpha(70));
+                    c.stroke_round_rect(lat_r, R_SM, 1.0, theme::border());
                     c.draw_text(&lat_txt, lat_r, state.fonts.mono_bold, lcol, DT_CENTER);
                     right_limit = lat_r.x - 10.0;
                 }
@@ -1309,7 +949,7 @@ fn paint_custom_tab(
             let text_w = (right_limit - text_left).max(60.0);
             c.draw_text(
                 root,
-                RectF::new(text_left, y + 10.0, text_w, 19.0),
+                RectF::new(text_left, y + 2.0, text_w, 19.0),
                 state.fonts.group,
                 if item.enabled { theme::text() } else { theme::text_muted() },
                 DT_LEFT,
@@ -1342,7 +982,7 @@ fn paint_custom_tab(
                 let col = if h == Health::Fail {
                     theme::danger()
                 } else if matches!(best_dns, DnsState::Poisoned | DnsState::Failed) {
-                    theme::warning()
+                    theme::info()
                 } else {
                     theme::text_muted()
                 };
@@ -1350,7 +990,7 @@ fn paint_custom_tab(
             };
             c.draw_text(
                 &meta,
-                RectF::new(text_left, y + 31.0, text_w, 16.0),
+                RectF::new(text_left, y + 20.0, text_w, 16.0),
                 state.fonts.caption,
                 meta_col,
                 DT_LEFT,
@@ -1366,13 +1006,13 @@ fn paint_custom_tab(
 fn draw_scrollbar(c: &mut Canvas, area: RectF, content_h: f32, scroll_y: f32, max_scroll: f32) {
     if max_scroll > 0.5 && content_h > area.h {
         let track_h = (area.h - 8.0).max(20.0);
-        let thumb_h = ((area.h / content_h) * track_h).clamp(24.0, track_h);
+        let thumb_h = ((area.h / content_h) * track_h).clamp(20.0, track_h);
         let ratio = scroll_y / max_scroll;
         let thumb_y = area.y + 4.0 + ratio * (track_h - thumb_h);
         c.fill_round_rect(
             RectF::new(area.right() - 7.0, thumb_y, 4.0, thumb_h),
             2.0,
-            WHITE.with_alpha(52),
+            theme::neutral(),
         );
     }
 }
@@ -1426,7 +1066,7 @@ fn layout_edit(hwnd: HWND, state: &UiState) {
         let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         GetClientRect(hwnd, &mut cr);
         let scale = state.dpi as f32 / 96.0;
-        let lw = ((cr.right - cr.left).max(1) as f32 / scale).max(320.0);
+        let lw = ((cr.right - cr.left).max(1) as f32 / scale).max(MIN_W);
         let inp = custom_input_rect(lw);
         let eh = 18.0;
         let px = ((inp.x + 10.0) * scale).round() as i32;
@@ -1494,11 +1134,12 @@ fn focus_domain_input(hwnd: HWND, state: &mut UiState) {
         return;
     }
     layout_edit(hwnd, state);
-    unsafe {
-        ShowWindow(state.edit_hwnd, SW_SHOW);
-        SetFocus(state.edit_hwnd);
-    }
     state.edit_focused = true;
+    let edit = state.edit_hwnd;
+    unsafe {
+        ShowWindow(edit, SW_SHOW);
+        SetFocus(edit);
+    }
 }
 
 fn apply_batch_add_feedback(hwnd: HWND, state: &mut UiState, res: &proxy::BatchAddResult) {
@@ -1510,9 +1151,8 @@ fn apply_batch_add_feedback(hwnd: HWND, state: &mut UiState, res: &proxy::BatchA
             format!("Đã thêm {} tên miền · Đang kiểm tra…", res.added.len())
         };
         set_notice(hwnd, state, msg, theme::success());
-        sync_timer(hwnd, state);
     } else if let Some(err) = res.first_err {
-        set_notice(hwnd, state, err.to_string(), theme::warning());
+        set_notice(hwnd, state, err.to_string(), theme::danger());
     }
 }
 
@@ -1587,7 +1227,7 @@ impl DohDialog {
         Self {
             dpi,
             fonts: FontSet::new(dpi),
-            background: unsafe { CreateSolidBrush(theme::surface().colorref()) },
+            background: unsafe { CreateSolidBrush(theme::bg().colorref()) },
             input: unsafe { CreateSolidBrush(theme::surface_inset().colorref()) },
             help_color: std::cell::Cell::new(theme::text_muted()),
             probe: std::cell::RefCell::new(None),
@@ -1727,7 +1367,7 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 let hint = GetDlgCtrlID(lp as HWND) == DOH_HELP;
                 let color = if hint { (*state).help_color.get() } else { theme::text() };
                 SetTextColor(hdc, color.colorref());
-                SetBkColor(hdc, if edit { theme::surface_inset() } else { theme::surface() }.colorref());
+                SetBkColor(hdc, if edit { theme::surface_inset() } else { theme::bg() }.colorref());
                 if edit { (*state).input as isize } else { (*state).background as isize }
             }
             WM_DRAWITEM if !state.is_null() && matches!(wp as i32, IDOK | IDCANCEL | DOH_TEST) => {
@@ -1746,11 +1386,11 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     DOH_TEST => "Thử kết nối",
                     _ => "Hủy",
                 };
-                paint_utility_button(&mut c, &state.fonts, rect, label,
+                paint_button(&mut c, &state.fonts, rect, label,
                     primary, item.itemState & ODS_SELECTED != 0);
                 if item.itemState & ODS_FOCUS != 0 {
                     c.stroke_round_rect(RectF::new(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, rect.h - 6.0),
-                        R_SM - 2.0, 1.0, theme::info());
+                        R_SM - 2.0, 1.0, if primary { theme::on_primary() } else { theme::text() });
                 }
                 1
             }
@@ -1813,7 +1453,6 @@ fn select_doh_ui(hwnd: HWND, provider: DohProvider) {
     if let Some(state) = get_state(hwnd) {
         let msg = format!("DoH {} ({}) · Đang đo lại…", provider.label(), provider.addr());
         set_notice(hwnd, state, msg, theme::info());
-        sync_timer(hwnd, state);
     }
     unsafe {
         InvalidateRect(hwnd, null(), 0);
@@ -1846,7 +1485,6 @@ fn reset_network_ui(hwnd: HWND) {
     update_tray_tip(hwnd);
     if let Some(state) = get_state(hwnd) {
         state.last_tray_on = false;
-        sync_timer(hwnd, state);
         set_notice(
             hwnd,
             state,
@@ -1856,20 +1494,6 @@ fn reset_network_ui(hwnd: HWND) {
     }
     unsafe {
         InvalidateRect(hwnd, null(), 0);
-    }
-}
-
-fn sync_timer(hwnd: HWND, state: &mut UiState) {
-    let target = if ENABLED.load(Ordering::SeqCst) { 1.0 } else { 0.0 };
-    let need = (state.toggle_t - target).abs() > 0.01 || PENDING.load(Ordering::SeqCst) > 0;
-    unsafe {
-        if need && !state.anim_timer {
-            SetTimer(hwnd, ID_TIMER_ANIM, 16, None);
-            state.anim_timer = true;
-        } else if !need && state.anim_timer {
-            KillTimer(hwnd, ID_TIMER_ANIM);
-            state.anim_timer = false;
-        }
     }
 }
 
@@ -1967,6 +1591,8 @@ fn apply_dwm(hwnd: HWND) {
         }
         let cap = theme::bg().colorref();
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR as u32, (&cap as *const u32).cast(), 4);
+        let ink = theme::text().colorref();
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR as u32, (&ink as *const u32).cast(), 4);
         let brd = theme::border().colorref();
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR as u32, (&brd as *const u32).cast(), 4);
         let round = DWMWCP_ROUND as u32;
@@ -2048,22 +1674,101 @@ fn utility_command(hwnd: HWND, command: usize) {
     }
 }
 
+fn doh_menu_label(provider: DohProvider) -> String {
+    if provider == DohProvider::Custom { "Custom…".into() } else { format!("{} ({})", provider.label(), provider.addr()) }
+}
+
+fn create_doh_menu(current: DohProvider, owner_drawn: bool) -> HMENU {
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return menu;
+        }
+        for (index, provider) in DohProvider::ALL.into_iter().enumerate() {
+            let id = ID_MENU_DOH_BASE + index;
+            let flags = MF_STRING | if provider == current { MF_CHECKED } else { 0 };
+            AppendMenuW(menu, flags, id, wide(&doh_menu_label(provider)).as_ptr());
+            if owner_drawn {
+                let item = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE,
+                    fType: MFT_OWNERDRAW,
+                    ..Default::default()
+                };
+                SetMenuItemInfoW(menu, id as u32, 0, &item);
+            }
+        }
+        menu
+    }
+}
+
+fn doh_menu_provider(command: usize) -> Option<DohProvider> {
+    DohProvider::ALL.get(command.checked_sub(ID_MENU_DOH_BASE)?).copied()
+}
+
+fn show_doh_menu(hwnd: HWND) {
+    let Some(dpi) = get_state(hwnd).map(|state| state.dpi) else { return };
+    let scale = dpi as f32 / 96.0;
+    unsafe {
+        let mut client: RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut client) == 0 {
+            return;
+        }
+        let width = ((client.right - client.left) as f32 / scale).max(MIN_W);
+        let bounds = action_buttons(width).0.to_gdi_rect(scale);
+        let mut anchor = POINT { x: bounds.right, y: bounds.bottom + 1 };
+        if ClientToScreen(hwnd, &mut anchor) == 0 {
+            return;
+        }
+
+        let menu = create_doh_menu(proxy::doh_provider(), true);
+        if menu.is_null() {
+            return;
+        }
+        let background = CreateSolidBrush(theme::surface().colorref());
+        let menu_info = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MIM_BACKGROUND | MIM_STYLE,
+            dwStyle: MNS_NOCHECK,
+            hbrBack: background,
+            ..Default::default()
+        };
+        SetMenuInfo(menu, &menu_info);
+        let command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTALIGN,
+            anchor.x, anchor.y, 0, hwnd, null()) as usize;
+        DestroyMenu(menu);
+        if !background.is_null() {
+            DeleteObject(background);
+        }
+        if let Some(provider) = doh_menu_provider(command) {
+            select_doh_ui(hwnd, provider);
+        }
+    }
+}
+
+fn draw_doh_menu_item(item: &DRAWITEMSTRUCT, provider: DohProvider, state: &UiState) {
+    let scale = state.dpi as f32 / 96.0;
+    let bounds = item.rcItem;
+    let r = RectF::new(bounds.left as f32 / scale, bounds.top as f32 / scale,
+        (bounds.right - bounds.left) as f32 / scale, (bounds.bottom - bounds.top) as f32 / scale);
+    let mut c = Canvas::new(item.hDC, state.dpi);
+    let selected = item.itemState & ODS_SELECTED != 0;
+    let checked = item.itemState & ODS_CHECKED != 0;
+    c.fill_rect(r, if selected { theme::surface_hover() } else { theme::surface() });
+    if checked {
+        c.draw_checkmark(r.x + 15.0, r.cy(), 8.0, 1.5, theme::info());
+    }
+    c.draw_text(&doh_menu_label(provider), RectF::new(r.x + 29.0, r.y, r.w - 39.0, r.h),
+        state.fonts.body, if checked { theme::info() } else { theme::text() }, DT_LEFT);
+}
+
 fn show_tray_menu(hwnd: HWND) {
     let on = ENABLED.load(Ordering::SeqCst);
     let cur_doh = proxy::doh_provider();
     let pending = PENDING.load(Ordering::SeqCst) > 0;
     unsafe {
         let menu = CreatePopupMenu();
-        let doh_menu = CreatePopupMenu();
-        for (idx, &prov) in DohProvider::ALL.iter().enumerate() {
-            let item_txt = if prov == DohProvider::Custom { "Custom…".to_owned() } else { format!("{} ({})", prov.label(), prov.addr()) };
-            AppendMenuW(
-                doh_menu,
-                MF_STRING | if prov == cur_doh { MF_CHECKED } else { 0 },
-                ID_MENU_DOH_BASE + idx,
-                wide(&item_txt).as_ptr(),
-            );
-        }
+        let doh_menu = create_doh_menu(cur_doh, false);
 
         AppendMenuW(
             menu,
@@ -2122,29 +1827,15 @@ fn show_tray_menu(hwnd: HWND) {
         DestroyMenu(menu);
 
         let cmd_id = cmd as usize;
-        if cmd_id >= ID_MENU_DOH_BASE && cmd_id < ID_MENU_DOH_BASE + DohProvider::ALL.len() {
-            select_doh_ui(hwnd, DohProvider::from_index(cmd_id - ID_MENU_DOH_BASE));
+        if let Some(provider) = doh_menu_provider(cmd_id) {
+            select_doh_ui(hwnd, provider);
             return;
         }
 
         match cmd_id {
             ID_MENU_OPEN => show_main(hwnd),
-            ID_MENU_TOGGLE => {
-                proxy::set_enabled(!on);
-                update_tray_tip(hwnd);
-                if let Some(st) = get_state(hwnd) {
-                    sync_timer(hwnd, st);
-                }
-                InvalidateRect(hwnd, null(), 0);
-            }
-            ID_MENU_TEST => {
-                proxy::clear_dns_cache();
-                proxy::run_test();
-                if let Some(st) = get_state(hwnd) {
-                    sync_timer(hwnd, st);
-                }
-                InvalidateRect(hwnd, null(), 0);
-            }
+            ID_MENU_TOGGLE => activate_action(hwnd, Action::ToggleBypass),
+            ID_MENU_TEST => activate_action(hwnd, Action::RunTest),
             ID_MENU_DIRECT_CDN | ID_MENU_AUTOSTART | ID_LIGHT | ID_DARK | ID_UPDATE => utility_command(hwnd, cmd_id),
             ID_MENU_RESET_NET => reset_network_ui(hwnd),
             ID_MENU_EXIT => {
@@ -2153,6 +1844,132 @@ fn show_tray_menu(hwnd: HWND) {
             _ => {}
         }
     }
+}
+
+fn activate_action(hwnd: HWND, action: Action) {
+    match action {
+        Action::ToggleBypass => proxy::set_enabled(!ENABLED.load(Ordering::SeqCst)),
+        Action::OpenDohMenu => show_doh_menu(hwnd),
+        Action::SelectTab(tab) => {
+            if let Some(state) = get_state(hwnd) {
+                if state.tab != tab {
+                    state.tab = tab;
+                    state.hover = None;
+                    sync_edit_visibility(hwnd, state);
+                }
+            }
+        }
+        Action::RunTest => {
+            if PENDING.load(Ordering::SeqCst) == 0 {
+                proxy::clear_dns_cache();
+                proxy::run_test();
+            }
+        }
+        Action::FocusInput => {
+            if let Some(state) = get_state(hwnd) {
+                focus_domain_input(hwnd, state);
+            }
+        }
+        Action::AddDomain => submit_domain_input(hwnd),
+        Action::ToggleGroup(index) => {
+            if let Some(state) = get_state(hwnd) {
+                state.expanded[index] = !state.expanded[index];
+            }
+        }
+        Action::ToggleCustomDomain(index) => {
+            let domain = get_state(hwnd).and_then(|state| state.row_targets.get(index).cloned());
+            if let Some(domain) = domain {
+                if let Some(on) = proxy::toggle_custom_domain(&domain) {
+                    if let Some(state) = get_state(hwnd) {
+                        let notice = if on {
+                            format!("Đã bật lại bypass cho {domain}")
+                        } else {
+                            format!("Đã tạm tắt bypass cho {domain}")
+                        };
+                        set_notice(hwnd, state, notice, if on { theme::success() } else { theme::text_sec() });
+                    }
+                }
+            }
+        }
+        Action::RemoveDomain(index) => {
+            let domain = get_state(hwnd).and_then(|state| state.row_targets.get(index).cloned());
+            if let Some(domain) = domain {
+                if proxy::remove_custom_domain(&domain) {
+                    if let Some(state) = get_state(hwnd) {
+                        state.keyboard_focus = None;
+                        state.hover = None;
+                        set_notice(hwnd, state, format!("Đã xóa {domain}"), theme::text_sec());
+                    }
+                }
+            }
+        }
+        Action::Utility(command) => utility_command(hwnd, command),
+        Action::QuitApp => {
+            unsafe { DestroyWindow(hwnd); }
+            return;
+        }
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0); }
+}
+
+fn move_control_focus(hwnd: HWND, backward: bool) {
+    let Some(state) = get_state(hwnd) else { return };
+    let count = state.hits.len();
+    if count == 0 {
+        return;
+    }
+    let current = if state.edit_focused { Some(Action::FocusInput) } else { state.keyboard_focus };
+    let position = state.hits.iter().position(|(_, action)| Some(*action) == current);
+    let next = match (position, backward) {
+        (Some(index), true) => (index + count - 1) % count,
+        (Some(index), false) => (index + 1) % count,
+        (None, true) => count - 1,
+        (None, false) => 0,
+    };
+    let action = state.hits[next].1;
+    state.keyboard_focus = Some(action);
+    if action == Action::FocusInput {
+        focus_domain_input(hwnd, state);
+    } else {
+        unsafe { SetFocus(hwnd); }
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0); }
+}
+
+fn scroll_list(hwnd: HWND, delta: f32) {
+    let Some(state) = get_state(hwnd) else { return };
+    let max = state.max_scroll;
+    if let Some(scroll) = state.current_scroll_mut() {
+        let next = (*scroll + delta).clamp(0.0, max);
+        if next != *scroll {
+            *scroll = next;
+            unsafe { InvalidateRect(hwnd, null(), 0); }
+        }
+    }
+}
+
+fn handle_navigation_key(hwnd: HWND, msg: &MSG, editing: bool) -> bool {
+    match msg.wParam as u16 {
+        VK_TAB => {
+            let backward = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
+            move_control_focus(hwnd, backward);
+        }
+        VK_PRIOR if !editing => scroll_list(hwnd, -200.0),
+        VK_NEXT if !editing => scroll_list(hwnd, 200.0),
+        VK_RETURN | VK_SPACE if !editing => {
+            let focused = get_state(hwnd).and_then(|state| {
+                let focus = state.keyboard_focus?;
+                state.hits.iter().any(|(_, action)| *action == focus).then_some(focus)
+            });
+            if let Some(action) = focused {
+                if msg.lParam & (1 << 30) == 0 {
+                    activate_action(hwnd, action);
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2219,6 +2036,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 0
             }
+            WM_MEASUREITEM if wp == 0 && lp != 0 => {
+                let item = &mut *(lp as *mut MEASUREITEMSTRUCT);
+                if item.CtlType == ODT_MENU && doh_menu_provider(item.itemID as usize).is_some() {
+                    let dpi = GetDpiForWindow(hwnd).max(72) as f32 / 96.0;
+                    item.itemWidth = (192.0 * dpi).round() as u32;
+                    item.itemHeight = (29.0 * dpi).round() as u32;
+                    return 1;
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_DRAWITEM if wp == 0 && lp != 0 => {
+                let item = &*(lp as *const DRAWITEMSTRUCT);
+                if item.CtlType == ODT_MENU {
+                    if let (Some(state), Some(provider)) = (get_state(hwnd), doh_menu_provider(item.itemID as usize)) {
+                        draw_doh_menu_item(item, provider, state);
+                        return 1;
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_CTLCOLOREDIT => {
                 let hdc = wp as HDC;
                 SetTextColor(hdc, theme::text().colorref());
@@ -2236,6 +2073,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         match code {
                             EN_SETFOCUS => {
                                 state.edit_focused = true;
+                                if state.keyboard_focus != Some(Action::FocusInput) {
+                                    state.keyboard_focus = None;
+                                }
                                 InvalidateRect(hwnd, null(), 0);
                             }
                             EN_KILLFOCUS => {
@@ -2332,6 +2172,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_LBUTTONDOWN => {
                 if let Some(state) = get_state(hwnd) {
+                    if state.keyboard_focus.take().is_some() {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
                     let s = state.dpi as f32 / 96.0;
                     let lx = ((lp as u32 & 0xFFFF) as i16) as f32 / s;
                     let ly = (((lp as u32 >> 16) & 0xFFFF) as i16) as f32 / s;
@@ -2352,120 +2195,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let ly = (((lp as u32 >> 16) & 0xFFFF) as i16) as f32 / s;
                     hit_test(state, lx, ly)
                 });
-                if let Some(a) = act {
-                    match a {
-                        Action::ToggleBypass => {
-                            let new_on = !ENABLED.load(Ordering::SeqCst);
-                            proxy::set_enabled(new_on);
-                            update_tray_tip(hwnd);
-                            if let Some(state) = get_state(hwnd) {
-                                sync_timer(hwnd, state);
-                            }
-                        }
-                        Action::SelectDoh(idx) => {
-                            select_doh_ui(hwnd, DohProvider::from_index(idx));
-                            return 0;
-                        }
-                        Action::SelectTab(tab) => {
-                            if let Some(state) = get_state(hwnd) {
-                                if state.tab != tab {
-                                    state.tab = tab;
-                                    state.hover = None;
-                                    sync_edit_visibility(hwnd, state);
-                                }
-                            }
-                        }
-                        Action::RunTest => {
-                            proxy::clear_dns_cache();
-                            proxy::run_test();
-                            if let Some(state) = get_state(hwnd) {
-                                sync_timer(hwnd, state);
-                            }
-                        }
-                        Action::FocusInput => {
-                            if let Some(state) = get_state(hwnd) {
-                                focus_domain_input(hwnd, state);
-                            }
-                        }
-                        Action::AddDomain => {
-                            submit_domain_input(hwnd);
-                            return 0;
-                        }
-                        Action::ToggleGroup(gi) => {
-                            if let Some(state) = get_state(hwnd) {
-                                state.expanded[gi] = !state.expanded[gi];
-                            }
-                        }
-                        Action::ToggleCustomDomain(idx) => {
-                            let domain = get_state(hwnd)
-                                .and_then(|s| s.row_targets.get(idx).cloned());
-                            if let Some(d) = domain {
-                                if let Some(now_on) = proxy::toggle_custom_domain(&d) {
-                                    if let Some(state) = get_state(hwnd) {
-                                        let msg = if now_on {
-                                            format!("Đã bật lại bypass cho {d}")
-                                        } else {
-                                            format!("Đã tạm tắt bypass cho {d}")
-                                        };
-                                        set_notice(hwnd, state, msg, if now_on { theme::success() } else { theme::text_sec() });
-                                        sync_timer(hwnd, state);
-                                    }
-                                }
-                            }
-                        }
-                        Action::RemoveDomain(idx) => {
-                            let domain = get_state(hwnd)
-                                .and_then(|s| s.row_targets.get(idx).cloned());
-                            if let Some(d) = domain {
-                                if proxy::remove_custom_domain(&d) {
-                                    if let Some(state) = get_state(hwnd) {
-                                        set_notice(hwnd, state, format!("Đã xóa {d}"), theme::text_sec());
-                                    }
-                                }
-                            }
-                        }
-                        Action::Utility(command) => {
-                            utility_command(hwnd, command);
-                            return 0;
-                        }
-                        Action::QuitApp => {
-                            DestroyWindow(hwnd);
-                            return 0;
-                        }
-                    }
-                    InvalidateRect(hwnd, null(), 0);
+                if let Some(action) = act {
+                    activate_action(hwnd, action);
                 }
                 0
             }
             WM_MOUSEWHEEL => {
-                if let Some(state) = get_state(hwnd) {
-                    if state.max_scroll > 0.5 {
-                        let delta = ((wp >> 16) as u16) as i16 as f32;
-                        let max_s = state.max_scroll;
-                        if let Some(cur) = state.current_scroll_mut() {
-                            *cur = (*cur - (delta / 120.0) * 34.0).clamp(0.0, max_s);
-                            InvalidateRect(hwnd, null(), 0);
-                        }
-                    }
-                }
-                0
-            }
-            WM_TIMER if wp == ID_TIMER_ANIM => {
-                if let Some(state) = get_state(hwnd) {
-                    let target = if ENABLED.load(Ordering::SeqCst) { 1.0 } else { 0.0 };
-                    let diff = target - state.toggle_t;
-                    // Subtle Motion (2/10): crisp ease-out (~140ms) without overshoot
-                    if diff.abs() <= 0.015 {
-                        state.toggle_t = target;
-                    } else {
-                        state.toggle_t += diff * 0.35;
-                    }
-                    if PENDING.load(Ordering::SeqCst) > 0 {
-                        state.spin_deg = (state.spin_deg + 8.0) % 360.0;
-                    }
-                    sync_timer(hwnd, state);
-                    InvalidateRect(hwnd, null(), 0);
-                }
+                let delta = ((wp >> 16) as u16) as i16 as f32;
+                scroll_list(hwnd, -(delta / 120.0) * 34.0);
                 0
             }
             WM_TIMER if wp == ID_TIMER_NOTICE => {
@@ -2490,7 +2227,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         "Mạng vừa đổi · Đang kiểm tra lại…".to_string()
                     };
                     set_notice(hwnd, state, msg, theme::info());
-                    sync_timer(hwnd, state);
                 }
                 InvalidateRect(hwnd, null(), 0);
                 0
@@ -2513,7 +2249,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let on = ENABLED.load(Ordering::SeqCst);
                 let mut tray_changed = false;
                 if let Some(state) = get_state(hwnd) {
-                    sync_timer(hwnd, state);
                     if state.last_tray_on != on {
                         state.last_tray_on = on;
                         tray_changed = true;
@@ -2548,12 +2283,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_DESTROY => {
                 KillTimer(hwnd, ID_TIMER_NOTICE);
-                if let Some(state) = get_state(hwnd) {
-                    if state.anim_timer {
-                        KillTimer(hwnd, ID_TIMER_ANIM);
-                        state.anim_timer = false;
-                    }
-                }
                 delete_tray(hwnd);
                 proxy::set_pac(false);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut UiState;
@@ -2678,9 +2407,6 @@ pub fn run(start_minimized: bool) {
         add_tray(hwnd);
         proxy::set_ui_hwnd(hwnd);
         proxy::run_test();
-        if let Some(st) = get_state(hwnd) {
-            sync_timer(hwnd, st);
-        }
 
         if start_minimized {
             ShowWindow(hwnd, SW_HIDE);
@@ -2691,7 +2417,13 @@ pub fn run(start_minimized: bool) {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if msg.message == WM_KEYDOWN && !edit_hwnd.is_null() && msg.hwnd == edit_hwnd {
+            let editing = !edit_hwnd.is_null() && msg.hwnd == edit_hwnd;
+            if msg.message == WM_KEYDOWN && (msg.hwnd == hwnd || editing)
+                && handle_navigation_key(hwnd, &msg, editing)
+            {
+                continue;
+            }
+            if msg.message == WM_KEYDOWN && editing {
                 if msg.wParam == VK_RETURN as usize {
                     SendMessageW(hwnd, WM_APP_ADD_DOMAIN, 0, 0);
                     continue;
@@ -2743,6 +2475,7 @@ mod tests {
             ("avatars.akamai.steamstatic.com".into(), make_stat(4, 3, 0, "23.200.230.152", DnsState::Clean, Some(22))),
             ("cdn.akamai.steamstatic.com".into(), make_stat(4, 2, 0, "23.200.230.169", DnsState::Clean, Some(25))),
             ("cdn.cloudflare.steamstatic.com".into(), make_stat(4, 4, 0, "104.84.150.196", DnsState::Clean, Some(19))),
+            ("steamgames.com".into(), make_stat(5, 2, 0, "23.15.142.182", DnsState::Clean, Some(28))),
         ];
         if with_custom {
             v.push(("bbc.com".into(), make_stat(CUSTOM_GROUP_IDX, 3, 0, "151.101.0.81", DnsState::Clean, Some(46))));
@@ -2756,6 +2489,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn render_bmp(
         path: &str,
+        size: (f32, f32),
         dpi: u32,
         tab: Tab,
         on: bool,
@@ -2768,8 +2502,8 @@ mod tests {
     ) {
         let _gdip = GdiplusGuard::new();
         let s = dpi as f32 / 96.0;
-        let pw = (WIN_W * s).round() as i32;
-        let ph = (WIN_H * s).round() as i32;
+        let pw = (size.0 * s).round() as i32;
+        let ph = (size.1 * s).round() as i32;
 
         unsafe {
             let mem_dc = CreateCompatibleDC(null_mut());
@@ -2794,6 +2528,11 @@ mod tests {
             paint_ui(mem_dc, pw, ph, &mut state, snap, custom_list, on, direct_cdn, doh, 0);
 
             let src = std::slice::from_raw_parts(bits as *const u8, (pw * ph * 4) as usize);
+            let expected_bg = if is_light() { 255 } else { 0 };
+            assert_eq!(&src[..3], &[expected_bg; 3], "main background");
+            for required in [Action::ToggleBypass, Action::OpenDohMenu, Action::QuitApp] {
+                assert!(state.hits.iter().any(|(_, action)| *action == required));
+            }
             let row_stride = ((pw as usize * 3) + 3) & !3;
             let img_size = row_stride * ph as usize;
             let file_size = 54 + img_size;
@@ -2834,6 +2573,62 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_moves_focus_and_opens_the_selected_tab() {
+        unsafe {
+            let window = CreateWindowExW(
+                0, wide("STATIC").as_ptr(), null(), 0, 0, 0, 0, 0,
+                HWND_MESSAGE, null_mut(), GetModuleHandleW(null()), null(),
+            );
+            assert!(!window.is_null());
+            let mut state = UiState::new(96, true, false, 0);
+            let bounds = RectF::new(0.0, 0.0, 50.0, 30.0);
+            state.hits.extend([
+                (bounds, Action::SelectTab(Tab::Steam)),
+                (bounds, Action::SelectTab(Tab::Custom)),
+                (bounds, Action::OpenDohMenu),
+            ]);
+            SetWindowLongPtrW(window, GWLP_USERDATA, (&mut state as *mut UiState) as isize);
+
+            let tab = MSG { hwnd: window, message: WM_KEYDOWN, wParam: VK_TAB as WPARAM, ..Default::default() };
+            handle_navigation_key(window, &tab, false);
+            assert!(state.keyboard_focus == Some(Action::SelectTab(Tab::Steam)));
+            handle_navigation_key(window, &tab, false);
+            let enter = MSG { wParam: VK_RETURN as WPARAM, ..tab };
+            handle_navigation_key(window, &enter, false);
+            assert!(state.tab == Tab::Custom);
+            move_control_focus(window, true);
+            assert!(state.keyboard_focus == Some(Action::SelectTab(Tab::Steam)));
+
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn themed_doh_menu_preserves_names_and_checked_provider() {
+        unsafe {
+            let menu = create_doh_menu(DohProvider::Google, true);
+            assert!(!menu.is_null());
+            for (index, provider) in DohProvider::ALL.into_iter().enumerate() {
+                let command = ID_MENU_DOH_BASE + index;
+                assert!(doh_menu_provider(command) == Some(provider));
+                let mut label = [0u16; 80];
+                let mut item = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE | MIIM_STATE | MIIM_STRING,
+                    dwTypeData: label.as_mut_ptr(),
+                    cch: label.len() as u32,
+                    ..Default::default()
+                };
+                assert_ne!(GetMenuItemInfoW(menu, command as u32, 0, &mut item), 0);
+                assert_ne!(item.fType & MFT_OWNERDRAW, 0);
+                assert_eq!(String::from_utf16_lossy(&label[..item.cch as usize]), doh_menu_label(provider));
+                assert_eq!(item.fState & MFS_CHECKED != 0, provider == DohProvider::Google);
+            }
+            DestroyMenu(menu);
+        }
+    }
+
+    #[test]
     fn render_ui_previews() {
         let dir = env!("CARGO_MANIFEST_DIR");
         let snap_custom = sample_snap(true);
@@ -2844,7 +2639,8 @@ mod tests {
         ];
 
         render_bmp(
-            &format!(r"{dir}\target\preview_v14_steam.bmp"),
+            &format!(r"{dir}\target\preview_monochrome_dark.bmp"),
+            (WIN_W, WIN_H),
             96,
             Tab::Steam,
             true,
@@ -2856,7 +2652,8 @@ mod tests {
             &custom_list,
         );
         render_bmp(
-            &format!(r"{dir}\target\preview_v14_steam_exp.bmp"),
+            &format!(r"{dir}\target\preview_monochrome_expanded.bmp"),
+            (WIN_W, WIN_H),
             96,
             Tab::Steam,
             true,
@@ -2868,7 +2665,8 @@ mod tests {
             &custom_list,
         );
         render_bmp(
-            &format!(r"{dir}\target\preview_v14_custom.bmp"),
+            &format!(r"{dir}\target\preview_monochrome_web.bmp"),
+            (WIN_W, WIN_H),
             96,
             Tab::Custom,
             true,
@@ -2880,10 +2678,27 @@ mod tests {
             &custom_list,
         );
 
+        set_light(true);
+        render_bmp(
+            &format!(r"{dir}\target\preview_monochrome_light.bmp"),
+            (WIN_W, WIN_H),
+            96,
+            Tab::Steam,
+            true,
+            true,
+            DohProvider::Cloudflare,
+            true,
+            None,
+            &snap_custom,
+            &custom_list,
+        );
+        set_light(false);
+
         for (light, suffix) in [(false, "dark"), (true, "light")] {
             set_light(light);
             render_bmp(
-                &format!(r"{dir}\target\preview_utilities_{suffix}.bmp"),
+                &format!(r"{dir}\target\preview_monochrome_utilities_{suffix}.bmp"),
+                (WIN_W, WIN_H),
                 96,
                 Tab::Utilities,
                 true,
@@ -2896,5 +2711,18 @@ mod tests {
             );
         }
         set_light(false);
+        render_bmp(
+            &format!(r"{dir}\target\preview_monochrome_minimum.bmp"),
+            (MIN_W, MIN_H),
+            120,
+            Tab::Steam,
+            true,
+            false,
+            DohProvider::Custom,
+            false,
+            Some(2),
+            &snap_custom,
+            &custom_list,
+        );
     }
 }

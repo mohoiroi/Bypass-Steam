@@ -8,6 +8,9 @@ mod theme;
 mod ui;
 mod update;
 
+// Product version shown in the desktop interface.
+pub(crate) const DISPLAY_VERSION: &str = "v1.0";
+
 use std::ptr::null;
 use windows_sys::Win32::UI::{
     HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
