@@ -48,13 +48,92 @@ const DOMAINS: &[&str] = &[
 /// Game download CDN domains skipped when `DIRECT_CDN` is enabled so Steam uses ISP local caches.
 const CDN_DOMAINS: &[&str] = &["steamcontent.com", "akamaihd.net"];
 
-pub const PRESET_DOMAINS: &[&str] = &[
-    "bbc.com",
-    "medium.com",
-    "reddit.com",
-    "imgur.com",
-    "pixiv.net",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DohProvider {
+    Cloudflare = 0,
+    Google = 1,
+    AdGuard = 2,
+    DnsSb = 3,
+}
+
+impl DohProvider {
+    pub const ALL: [DohProvider; 4] = [
+        DohProvider::Cloudflare,
+        DohProvider::Google,
+        DohProvider::AdGuard,
+        DohProvider::DnsSb,
+    ];
+
+    pub fn from_id(id: &str) -> Self {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "google" => Self::Google,
+            "adguard" => Self::AdGuard,
+            "dnssb" => Self::DnsSb,
+            _ => Self::Cloudflare,
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        Self::ALL.get(idx).copied().unwrap_or(Self::Cloudflare)
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Google => "google",
+            Self::AdGuard => "adguard",
+            Self::DnsSb => "dnssb",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "Cloudflare",
+            Self::Google => "Google",
+            Self::AdGuard => "AdGuard",
+            Self::DnsSb => "DNS.SB",
+        }
+    }
+
+    pub const fn addr(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "1.1.1.1",
+            Self::Google => "8.8.8.8",
+            Self::AdGuard => "94.140.14.14",
+            Self::DnsSb => "doh.dns.sb",
+        }
+    }
+
+    /// Ordered primary -> secondary -> resilient fallback JSON DoH endpoints.
+    pub const fn endpoints(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Cloudflare => &[
+                ("1.1.1.1", "/dns-query"),
+                ("1.0.0.1", "/dns-query"),
+                ("8.8.8.8", "/resolve"),
+            ],
+            Self::Google => &[
+                ("8.8.8.8", "/resolve"),
+                ("8.8.4.4", "/resolve"),
+                ("1.1.1.1", "/dns-query"),
+            ],
+            Self::AdGuard => &[
+                ("94.140.14.14", "/resolve"),
+                ("94.140.15.15", "/resolve"),
+                ("1.1.1.1", "/dns-query"),
+            ],
+            Self::DnsSb => &[
+                ("doh.dns.sb", "/dns-query"),
+                ("1.1.1.1", "/dns-query"),
+                ("8.8.8.8", "/resolve"),
+            ],
+        }
+    }
+}
 
 pub const CDN_GROUP_IDX: usize = 3;
 pub const CUSTOM_GROUP_IDX: usize = 6;
@@ -136,12 +215,14 @@ pub struct Stat {
     pub ip: String,
     pub dns: DnsState,
     pub last_ok: bool,
+    pub latency_ms: Option<u32>,
 }
 
 pub static STATS: Mutex<BTreeMap<String, Stat>> = Mutex::new(BTreeMap::new());
 pub static CUSTOM_DOMAINS: Mutex<Vec<CustomDomain>> = Mutex::new(Vec::new());
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static DIRECT_CDN: AtomicBool = AtomicBool::new(false);
+pub static DOH_PROVIDER: AtomicUsize = AtomicUsize::new(0);
 pub static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 static PAC_VERSION: AtomicUsize = AtomicUsize::new(1);
@@ -177,9 +258,24 @@ pub fn clear_dns_cache() {
 
 pub fn init_settings() {
     DIRECT_CDN.store(crate::config::load_direct_cdn(), Ordering::SeqCst);
+    let provider = crate::config::load_doh_provider()
+        .map(|id| DohProvider::from_id(&id))
+        .unwrap_or(DohProvider::Cloudflare);
+    DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
     let loaded = crate::config::load_custom_domains();
     let mut list = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
     *list = loaded;
+}
+
+pub fn doh_provider() -> DohProvider {
+    DohProvider::from_index(DOH_PROVIDER.load(Ordering::SeqCst))
+}
+
+pub fn set_doh_provider(provider: DohProvider) {
+    DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
+    let _ = crate::config::save_doh_provider(provider.id());
+    clear_dns_cache();
+    notify_ui();
 }
 
 pub fn set_direct_cdn(direct: bool) {
@@ -351,7 +447,13 @@ pub fn seed_stats() {
     }
 }
 
-fn record(host: &str, ok: bool, ip: Option<IpAddr>, dns: Option<DnsState>) {
+fn record(
+    host: &str,
+    ok: bool,
+    ip: Option<IpAddr>,
+    dns: Option<DnsState>,
+    latency_ms: Option<u32>,
+) {
     {
         let mut m = STATS.lock().unwrap_or_else(|e| e.into_inner());
         let s = m.entry(host.to_string()).or_default();
@@ -359,8 +461,12 @@ fn record(host: &str, ok: bool, ip: Option<IpAddr>, dns: Option<DnsState>) {
         if ok {
             s.ok += 1;
             s.fail = 0;
+            if let Some(ms) = latency_ms {
+                s.latency_ms = Some(ms);
+            }
         } else {
             s.fail += 1;
+            s.latency_ms = None;
         }
         s.last_ok = ok;
         if let Some(ip) = ip {
@@ -477,12 +583,12 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
         }
     }
 
-    let mut ips = query_doh_server("1.1.1.1", "/dns-query", host);
-    if ips.is_empty() {
-        ips = query_doh_server("1.0.0.1", "/dns-query", host);
-    }
-    if ips.is_empty() {
-        ips = query_doh_server("8.8.8.8", "/resolve", host);
+    let mut ips = Vec::new();
+    for &(server, endpoint) in doh_provider().endpoints() {
+        ips = query_doh_server(server, endpoint, host);
+        if !ips.is_empty() {
+            break;
+        }
     }
     if !ips.is_empty() {
         CACHE
@@ -802,22 +908,24 @@ pub fn start_proxy() -> bool {
 
 fn connect_upstream(host: &str, port: u16) -> Option<TcpStream> {
     let ips = resolve_doh_all(host);
-    let mut connected: Option<(TcpStream, IpAddr)> = None;
+    let mut connected: Option<(TcpStream, IpAddr, u32)> = None;
     for ip in ips.iter().take(2) {
         let addr = SocketAddr::new(*ip, port);
+        let t0 = Instant::now();
         if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(6)) {
-            connected = Some((s, *ip));
+            let ms = t0.elapsed().as_millis().clamp(1, 9999) as u32;
+            connected = Some((s, *ip, ms));
             break;
         }
     }
     match connected {
-        Some((s, ip)) => {
+        Some((s, ip, ms)) => {
             let _ = s.set_nodelay(true);
-            record(host, true, Some(ip), None);
+            record(host, true, Some(ip), None, Some(ms));
             Some(s)
         }
         None => {
-            record(host, false, ips.first().copied(), None);
+            record(host, false, ips.first().copied(), None, None);
             None
         }
     }
@@ -1008,14 +1116,17 @@ fn probe_host(host: &str) {
     let dns = classify_dns(&sys_ips, &doh_ips);
     let mut ok = false;
     let mut used_ip = doh_ips.first().copied();
+    let mut latency_ms = None;
     for ip in doh_ips.iter().take(2) {
+        let t0 = Instant::now();
         if TcpStream::connect_timeout(&SocketAddr::new(*ip, 443), Duration::from_secs(6)).is_ok() {
+            latency_ms = Some(t0.elapsed().as_millis().clamp(1, 9999) as u32);
             ok = true;
             used_ip = Some(*ip);
             break;
         }
     }
-    record(host, ok, used_ip, Some(dns));
+    record(host, ok, used_ip, Some(dns), latency_ms);
 }
 
 pub fn test_single_host(host: String) {
@@ -1154,6 +1265,25 @@ mod tests {
     fn handles_nxdomain() {
         let json = r#"{"Status":3,"Authority":[{"name":"com","type":6}]}"#;
         assert_eq!(parse_doh_a_record(json), None);
+    }
+
+    #[test]
+    fn parses_adguard_and_dnssb_payloads_and_provider_mapping() {
+        let adguard = r#"{"Question":[{"name":"store.steampowered.com.","type":1}],"Answer":[{"name":"store.steampowered.com.","data":"118.68.82.144","TTL":60,"type":1,"class":1}],"Status":0}"#;
+        assert_eq!(parse_doh_a_record(adguard), Some(IpAddr::V4(Ipv4Addr::new(118, 68, 82, 144))));
+
+        let dnssb = r#"{"Status":0,"Answer":[{"name":"store.steampowered.com.","type":1,"TTL":20,"data":"23.35.102.114"}]}"#;
+        assert_eq!(parse_doh_a_record(dnssb), Some(IpAddr::V4(Ipv4Addr::new(23, 35, 102, 114))));
+
+        assert_eq!(DohProvider::from_id("cloudflare"), DohProvider::Cloudflare);
+        assert_eq!(DohProvider::from_id("GOOGLE"), DohProvider::Google);
+        assert_eq!(DohProvider::from_id("adguard"), DohProvider::AdGuard);
+        assert_eq!(DohProvider::from_id("dnssb"), DohProvider::DnsSb);
+        assert_eq!(DohProvider::from_id("unknown"), DohProvider::Cloudflare);
+        for (i, p) in DohProvider::ALL.iter().enumerate() {
+            assert_eq!(DohProvider::from_index(i), *p);
+            assert!(!p.endpoints().is_empty());
+        }
     }
 
     #[test]

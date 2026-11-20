@@ -1,7 +1,7 @@
 //! Leak-free RAII wrappers around Win32 GDI+ (anti-aliased shapes) and GDI ClearType text.
 
 use crate::proxy::wide;
-use crate::theme::{ACCENT, Color, WHITE};
+use crate::theme::{ACCENT, Color, PRIMARY, WHITE};
 use std::ptr::null_mut;
 use windows_sys::Win32::{
     Foundation::RECT,
@@ -86,12 +86,15 @@ impl RectF {
 }
 
 pub struct FontSet {
+    pub kpi: HFONT,
     pub title: HFONT,
+    pub micro: HFONT,
     pub group: HFONT,
     pub body: HFONT,
     pub caption: HFONT,
     pub badge: HFONT,
     pub mono: HFONT,
+    pub mono_bold: HFONT,
 }
 
 fn make_font(face: &str, px: f32, weight: u32) -> HFONT {
@@ -120,12 +123,15 @@ impl FontSet {
     pub fn new(dpi: u32) -> Self {
         let s = dpi as f32 / 96.0;
         Self {
-            title: make_font("Segoe UI", 16.0 * s, FW_SEMIBOLD),
+            kpi: make_font("Consolas", 21.0 * s, FW_BOLD),
+            title: make_font("Segoe UI", 16.5 * s, FW_BOLD),
+            micro: make_font("Segoe UI", 10.0 * s, FW_SEMIBOLD),
             group: make_font("Segoe UI", 13.5 * s, FW_SEMIBOLD),
-            body: make_font("Segoe UI", 12.0 * s, FW_NORMAL),
+            body: make_font("Segoe UI", 12.5 * s, FW_NORMAL),
             caption: make_font("Segoe UI", 11.5 * s, FW_NORMAL),
             badge: make_font("Segoe UI", 11.0 * s, FW_SEMIBOLD),
             mono: make_font("Consolas", 11.0 * s, FW_NORMAL),
+            mono_bold: make_font("Consolas", 11.5 * s, FW_BOLD),
         }
     }
 }
@@ -133,7 +139,17 @@ impl FontSet {
 impl Drop for FontSet {
     fn drop(&mut self) {
         unsafe {
-            for h in [self.title, self.group, self.body, self.caption, self.badge, self.mono] {
+            for h in [
+                self.kpi,
+                self.title,
+                self.micro,
+                self.group,
+                self.body,
+                self.caption,
+                self.badge,
+                self.mono,
+                self.mono_bold,
+            ] {
                 if !h.is_null() {
                     DeleteObject(h as HGDIOBJ);
                 }
@@ -455,9 +471,18 @@ impl Canvas {
         self.draw_line(cx + r, cy - r, cx - r, cy + r, width, color, true);
     }
 
-    /// Draw the minimal blue squircle + jumping-arc logo matching `icon.ico`.
+    /// Minimalist geometric DNS / server node vector icon (no emoji).
+    pub fn draw_dns_icon(&mut self, cx: f32, cy: f32, r: f32, color: Color) {
+        self.stroke_circle(cx, cy, r, 1.35, color);
+        self.draw_line(cx - r + 0.5, cy, cx + r - 0.5, cy, 1.15, color.with_alpha(190), false);
+        self.draw_line(cx, cy - r + 0.5, cx, cy + r - 0.5, 1.15, color.with_alpha(190), false);
+    }
+
+    /// Draw the minimal shield-navy squircle + jumping-arc logo matching `MASTER.md`.
     pub fn draw_logo(&mut self, x: f32, y: f32, size: f32) {
-        self.fill_round_rect(RectF::new(x, y, size, size), size * 0.28, ACCENT);
+        let rect = RectF::new(x, y, size, size);
+        self.fill_round_rect(rect, size * 0.24, PRIMARY);
+        self.stroke_round_rect(rect, size * 0.24, 1.0, ACCENT.with_alpha(120));
         let k = size / 256.0;
         let px = |vx: f32| x + vx * k;
         let py = |vy: f32| y + vy * k;
@@ -469,7 +494,7 @@ impl Canvas {
             px(128.0),
             py(190.0),
             20.0 * k,
-            WHITE.with_alpha(150),
+            ACCENT,
             true,
         );
         // Arc + left/right legs
@@ -535,39 +560,6 @@ impl Canvas {
             );
             SelectObject(self.hdc, prev);
         }
-    }
-
-    pub fn draw_pill(
-        &mut self,
-        anchor_x: f32,
-        cy: f32,
-        label: &str,
-        fg: Color,
-        bg: Color,
-        dot: Option<Color>,
-        font: HFONT,
-        right_align: bool,
-    ) -> RectF {
-        let (tw, th) = self.measure_text(label, font);
-        let pad_x = 8.0;
-        let h = (th + 6.0).max(20.0);
-        let dot_w = if dot.is_some() { 11.0 } else { 0.0 };
-        let w = (tw + pad_x * 2.0 + dot_w).ceil();
-        let x = if right_align { anchor_x - w } else { anchor_x };
-        let rect = RectF::new(x, cy - h * 0.5, w, h);
-
-        self.fill_round_rect(rect, h * 0.5, bg);
-        if let Some(dc) = dot {
-            self.fill_circle(x + pad_x + 3.0, cy, 3.0, dc);
-        }
-        self.draw_text(
-            label,
-            RectF::new(x + pad_x + dot_w, rect.y, tw + 4.0, h),
-            font,
-            fg,
-            DT_LEFT,
-        );
-        rect
     }
 }
 

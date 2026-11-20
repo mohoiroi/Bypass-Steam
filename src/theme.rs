@@ -1,4 +1,5 @@
-//! Design system tokens: colors, spacing, radii, and window dimensions.
+//! Design system tokens generated via UI UX Pro Max (`MASTER.md`):
+//! Minimalist Scientific Utility · Variance 8 (Bold/Asymmetric) · Motion 2 (Subtle) · Density 3 (Spacious).
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Color {
@@ -43,41 +44,45 @@ impl Color {
     }
 }
 
-// ---- Color tokens ----
-pub const BG: Color = Color::rgb(0x0D, 0x10, 0x17);
-pub const SURFACE: Color = Color::rgb(0x14, 0x19, 0x23);
-pub const SURFACE_INSET: Color = Color::rgb(0x0F, 0x13, 0x1B);
-pub const SURFACE_HOVER: Color = Color::rgb(0x1B, 0x22, 0x30);
-pub const SURFACE_ELEV: Color = Color::rgb(0x1F, 0x28, 0x38);
-pub const BTN_BG: Color = Color::rgb(0x1B, 0x22, 0x30);
-pub const BTN_HOVER: Color = Color::rgb(0x24, 0x2E, 0x42);
-pub const BORDER: Color = Color::rgb(0x23, 0x2A, 0x38);
-pub const BORDER_SUB: Color = Color::rgb(0x1C, 0x22, 0x30);
+// ---- Semantic color tokens (from design-system/steam-bypass/MASTER.md) ----
+pub const BG: Color = Color::rgb(0x0F, 0x17, 0x2A);           // --color-background
+pub const SURFACE: Color = Color::rgb(0x19, 0x21, 0x34);      // --color-card
+pub const SURFACE_INSET: Color = Color::rgb(0x10, 0x19, 0x2E);// --color-muted
+pub const SURFACE_HOVER: Color = Color::rgb(0x21, 0x2C, 0x44);
+pub const SURFACE_ELEV: Color = Color::rgb(0x33, 0x41, 0x55); // --color-secondary
+pub const PRIMARY: Color = Color::rgb(0x1E, 0x3A, 0x5F);      // --color-primary (Shield Navy)
+pub const PRIMARY_HOVER: Color = Color::rgb(0x27, 0x4B, 0x7A);
+pub const BTN_BG: Color = Color::rgb(0x1E, 0x29, 0x3B);
+pub const BORDER: Color = Color::rgb(0x2A, 0x36, 0x4F);       // Crisp scientific hairline
+pub const BORDER_SUB: Color = Color::rgb(0x1F, 0x2A, 0x40);
 
-pub const TEXT: Color = Color::rgb(0xF1, 0xF5, 0xF9);
-pub const TEXT_SEC: Color = Color::rgb(0xCB, 0xD5, 0xE1);
-pub const TEXT_MUTED: Color = Color::rgb(0x8B, 0x95, 0xA7);
-pub const TEXT_DIM: Color = Color::rgb(0x5B, 0x64, 0x75);
+pub const TEXT: Color = Color::rgb(0xFF, 0xFF, 0xFF);         // --color-foreground (>15:1)
+pub const TEXT_SEC: Color = Color::rgb(0xE2, 0xE8, 0xF0);     // (>12:1)
+pub const TEXT_MUTED: Color = Color::rgb(0x94, 0xA3, 0xB8);   // --color-muted-foreground (>5.5:1)
+pub const TEXT_DIM: Color = Color::rgb(0x64, 0x74, 0x8B);
 
-pub const ACCENT: Color = Color::rgb(0x3B, 0x82, 0xF6);
-pub const ACCENT_HOVER: Color = Color::rgb(0x52, 0x94, 0xFF);
+pub const ACCENT: Color = Color::rgb(0x22, 0xC5, 0x5E);       // --color-accent (Connected Green)
+pub const ACCENT_HOVER: Color = Color::rgb(0x34, 0xD3, 0x70);
+pub const ON_ACCENT: Color = Color::rgb(0x0F, 0x17, 0x2A);    // --color-on-accent (>8:1)
+pub const INFO: Color = Color::rgb(0x38, 0xBD, 0xF8);         // Telemetry Cyan / Direct CDN
 pub const SUCCESS: Color = Color::rgb(0x22, 0xC5, 0x5E);
 pub const WARNING: Color = Color::rgb(0xF5, 0x9E, 0x0B);
-pub const DANGER: Color = Color::rgb(0xEF, 0x44, 0x44);
-pub const NEUTRAL: Color = Color::rgb(0x64, 0x74, 0x8B);
+pub const DANGER: Color = Color::rgb(0xEF, 0x44, 0x44);       // Readable destructive on dark
+pub const DESTRUCTIVE: Color = Color::rgb(0xDC, 0x26, 0x26);  // --color-destructive
+pub const NEUTRAL: Color = Color::rgb(0x47, 0x55, 0x69);
 pub const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
 
 pub const fn tint(c: Color) -> Color {
-    c.with_alpha(34)
+    c.with_alpha(30)
 }
 
-// ---- Window & layout tokens (logical px at 96 DPI, 8px grid) ----
-pub const WIN_W: f32 = 480.0;
-pub const WIN_H: f32 = 540.0;
-pub const MIN_W: f32 = 440.0;
-pub const MIN_H: f32 = 496.0;
+// ---- Window & layout tokens (Spacious Density 3/10, 8px base grid) ----
+pub const WIN_W: f32 = 528.0;
+pub const WIN_H: f32 = 620.0;
+pub const MIN_W: f32 = 480.0;
+pub const MIN_H: f32 = 540.0;
 
-pub const PAD_X: f32 = 20.0;
-pub const R_CARD: f32 = 12.0;
+pub const PAD_X: f32 = 24.0;
+pub const R_CARD: f32 = 10.0;
 pub const R_BTN: f32 = 8.0;
 pub const R_SM: f32 = 6.0;

@@ -10,6 +10,7 @@ const RUN_VALUE: &str = "SteamBypass";
 const APP_KEY: &str = r"Software\SteamBypass";
 const CUSTOM_DOMAINS_VALUE: &str = "CustomDomains";
 const DIRECT_CDN_VALUE: &str = "DirectCdn";
+const DOH_PROVIDER_VALUE: &str = "DohProvider";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomDomain {
@@ -138,6 +139,17 @@ pub fn load_direct_cdn() -> bool {
 
 pub fn save_direct_cdn(direct: bool) -> bool {
     write_reg_sz(APP_KEY, DIRECT_CDN_VALUE, if direct { "1" } else { "0" })
+}
+
+// ---------------- DoH Provider ----------------
+pub fn load_doh_provider() -> Option<String> {
+    read_reg_sz(APP_KEY, DOH_PROVIDER_VALUE)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn save_doh_provider(id: &str) -> bool {
+    write_reg_sz(APP_KEY, DOH_PROVIDER_VALUE, id)
 }
 
 // ---------------- Custom Domains ----------------

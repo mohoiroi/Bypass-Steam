@@ -6,17 +6,17 @@
 - Không cần cài đặt, nhấp đúp là chạy ngay.
 
 ## Tính năng
-- **Chống chặn DNS (DNS-over-HTTPS):** Phân giải IP thật qua Cloudflare (`1.1.1.1` / `1.0.0.1`) và dự phòng Google (`8.8.8.8`), tự thử nhiều IP CDN nếu IP đầu lỗi.
+- **Tùy chọn máy chủ DNS-over-HTTPS (DoH):** Hỗ trợ chuyển nhanh giữa 4 máy chủ DoH (**Cloudflare** `1.1.1.1`, **Google** `8.8.8.8`, **AdGuard** `94.140.14.14` lọc quảng cáo, **DNS.SB** `doh.dns.sb`) kèm cơ chế dự phòng tự động và tự thử nhiều IP CDN nếu IP đầu lỗi.
+- **Đo Ping / Độ trễ kết nối (Latency ms):** Đo thời gian bắt tay TCP trực tiếp, hiển thị độ trễ trung bình và từng cụm dịch vụ / máy chủ / web tùy chỉnh theo thang màu trực quan (`<60ms`, `60–150ms`, `>150ms`).
 - **Chống chặn SNI/DPI:** Tách gói TLS `ClientHello` (HTTPS) và HTTP tại proxy cục bộ `127.0.0.1:8899`.
 - **Đi thẳng CDN tải game:** Tùy chọn giữ nguyên tốc độ tải game gốc từ cache nội mạng VN (bỏ qua proxy cho `steamcontent.com`, `akamaihd.net`) trong khi vẫn bypass Store, Cộng đồng và Đăng nhập.
 - **Thêm tên miền web khác (tab *Web khác*):**
   - Nhập hoặc dán **nhiều tên miền cùng lúc** (cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng).
-  - Gợi ý 1-click các trang hay bị chặn DPI (`bbc.com`, `medium.com`, `reddit.com`, `imgur.com`, `pixiv.net`).
   - Có công tắc **bật/tắt tạm từng trang** mà không cần xóa, tự lưu cài đặt bền vững.
   - *(Lưu ý: chỉ vượt chặn DNS/DPI nhà mạng; trang tự chặn IP quốc gia/WAF lỗi `403` cần VPN.)*
 - **Khởi chạy cùng Windows:** Tự động chạy ẩn dưới khay hệ thống (`--minimized`) khi mở máy.
 - **Tự phục hồi kết nối:** Tự xóa cache DNS và kiểm tra lại khi máy thức dậy sau Sleep hoặc khi đổi Wi-Fi/LAN; kèm nút **Khôi phục mạng (Gỡ proxy)** ngay trong menu khay hệ thống.
-- **Chạy độc lập:** File `.exe` duy nhất (~410 KB, RAM ~9 MB), không cần cài thư viện ngoài hay quyền Admin.
+- **Giao diện tối giản khoa học (Native Win32/GDI+):** Bố cục Bento bất đối xứng rõ ràng, file `.exe` duy nhất (~416 KB), không cần cài thư viện ngoài hay quyền Admin.
 
 ## Cách sử dụng
 1. Chạy `steam_bypass.exe` (không cần quyền Admin).
