@@ -53,7 +53,7 @@ pub enum DohProvider {
     Cloudflare = 0,
     Google = 1,
     AdGuard = 2,
-    DnsSb = 3,
+    Custom = 3,
 }
 
 impl DohProvider {
@@ -61,14 +61,14 @@ impl DohProvider {
         DohProvider::Cloudflare,
         DohProvider::Google,
         DohProvider::AdGuard,
-        DohProvider::DnsSb,
+        DohProvider::Custom,
     ];
 
     pub fn from_id(id: &str) -> Self {
         match id.trim().to_ascii_lowercase().as_str() {
             "google" => Self::Google,
             "adguard" => Self::AdGuard,
-            "dnssb" => Self::DnsSb,
+            "custom" | "dnssb" => Self::Custom,
             _ => Self::Cloudflare,
         }
     }
@@ -86,7 +86,7 @@ impl DohProvider {
             Self::Cloudflare => "cloudflare",
             Self::Google => "google",
             Self::AdGuard => "adguard",
-            Self::DnsSb => "dnssb",
+            Self::Custom => "custom",
         }
     }
 
@@ -95,17 +95,17 @@ impl DohProvider {
             Self::Cloudflare => "Cloudflare",
             Self::Google => "Google",
             Self::AdGuard => "AdGuard",
-            Self::DnsSb => "DNS.SB",
+            Self::Custom => "Custom",
         }
     }
 
-    pub const fn addr(self) -> &'static str {
+    pub fn addr(self) -> String {
         match self {
             Self::Cloudflare => "1.1.1.1",
             Self::Google => "8.8.8.8",
             Self::AdGuard => "94.140.14.14",
-            Self::DnsSb => "doh.dns.sb",
-        }
+            Self::Custom => return custom_url().split('/' ).nth(2).unwrap_or("Custom").to_owned(),
+        }.to_owned()
     }
 
     /// Ordered primary -> secondary -> resilient fallback JSON DoH endpoints.
@@ -126,11 +126,7 @@ impl DohProvider {
                 ("94.140.15.15", "/resolve"),
                 ("1.1.1.1", "/dns-query"),
             ],
-            Self::DnsSb => &[
-                ("doh.dns.sb", "/dns-query"),
-                ("1.1.1.1", "/dns-query"),
-                ("8.8.8.8", "/resolve"),
-            ],
+            Self::Custom => &[],
         }
     }
 }
@@ -229,7 +225,7 @@ static PAC_VERSION: AtomicUsize = AtomicUsize::new(1);
 static UI_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static UI_DIRTY: AtomicBool = AtomicBool::new(false);
 
-type DnsCache = HashMap<String, (Vec<IpAddr>, Instant)>;
+type DnsCache = HashMap<(usize, String, String), (Vec<IpAddr>, Instant)>;
 static CACHE: Mutex<Option<DnsCache>> = Mutex::new(None);
 static WINHTTP_SESSION: OnceLock<usize> = OnceLock::new();
 
@@ -258,8 +254,14 @@ pub fn clear_dns_cache() {
 
 pub fn init_settings() {
     DIRECT_CDN.store(crate::config::load_direct_cdn(), Ordering::SeqCst);
-    let provider = crate::config::load_doh_provider()
+    let stored = crate::config::load_doh_provider();
+    let saved_url = crate::config::load_doh_url().or_else(|| {
+        (stored.as_deref() == Some("dnssb")).then(|| "https://doh.dns.sb/dns-query".to_string())
+    }).unwrap_or_default();
+    *CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()) = saved_url;
+    let provider = stored
         .map(|id| DohProvider::from_id(&id))
+        .filter(|p| *p != DohProvider::Custom || parse_endpoint(&custom_url()).is_some())
         .unwrap_or(DohProvider::Cloudflare);
     DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
     let loaded = crate::config::load_custom_domains();
@@ -271,11 +273,13 @@ pub fn doh_provider() -> DohProvider {
     DohProvider::from_index(DOH_PROVIDER.load(Ordering::SeqCst))
 }
 
-pub fn set_doh_provider(provider: DohProvider) {
+pub fn set_doh_provider(provider: DohProvider) -> bool {
+    if !crate::config::save_doh_provider(provider.id()) { return false; }
     DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
-    let _ = crate::config::save_doh_provider(provider.id());
+
     clear_dns_cache();
     notify_ui();
+    true
 }
 
 pub fn set_direct_cdn(direct: bool) {
@@ -508,19 +512,111 @@ fn winhttp_session() -> Option<*mut core::ffi::c_void> {
     }
 }
 
-fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Vec<IpAddr> {
+static CUSTOM_URL: Mutex<String> = Mutex::new(String::new());
+
+pub fn custom_url() -> String {
+    CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn save_custom_url(url: &str) -> bool {
+    if parse_endpoint(url).is_none() || !crate::config::save_doh_url(url) {
+        return false;
+    }
+    *CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()) = url.to_owned();
+    true
+}
+
+pub fn parse_endpoint(url: &str) -> Option<(&str, u16, &str)> {
+    if url.len() > 2048 || !url.bytes().all(|c| c.is_ascii_graphic()) || url.contains(['#', '\\']) {
+        return None;
+    }
+    let rest = url.strip_prefix("https://")?;
+    let slash = rest.find('/')?;
+    let authority = &rest[..slash];
+    let path = &rest[slash..];
+    let (host, port) = if let Some(ip) = authority.strip_prefix('[') {
+        let (host, suffix) = ip.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        (host, suffix.strip_prefix(':').or(if suffix.is_empty() { Some("443") } else { None })?)
+    } else {
+        let (host, port) = authority.split_once(':').unwrap_or((authority, "443"));
+        if host.len() > 253 || !host.split('.').all(|s| !s.is_empty() && s.len() <= 63
+            && !s.starts_with('-') && !s.ends_with('-') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+            return None;
+        }
+        (host, port)
+    };
+    let port = port.parse::<u16>().ok()?;
+    (port > 0).then_some((host, port, path))
+}
+
+fn dns_question(host: &str) -> Option<Vec<u8>> {
+    let mut msg = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.len() > 253 { return None; }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 { return None; }
+        msg.push(label.len() as u8);
+        msg.extend_from_slice(label.as_bytes());
+    }
+    msg.extend_from_slice(&[0, 0, 1, 0, 1]);
+    Some(msg)
+}
+
+fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *data.get(pos)? as usize;
+        pos += 1;
+        match len {
+            0 => return Some(pos),
+            1..=63 => { data.get(pos..pos + len)?; pos += len; }
+            192..=255 => { data.get(pos)?; return Some(pos + 1); }
+            _ => return None,
+        }
+    }
+}
+
+fn wire_addresses(data: &[u8]) -> Option<Vec<IpAddr>> {
+    let header = data.get(..12)?;
+    if header[..2] != [0, 0] || header[2] & 0xfa != 0x80 || header[4..6] != [0, 1] {
+        return None;
+    }
+    if header[3] & 15 != 0 { return Some(Vec::new()); }
+    let mut pos = skip_dns_name(data, 12)? + 4;
+    data.get(..pos)?;
+    let mut ips = Vec::new();
+    for _ in 0..u16::from_be_bytes([header[6], header[7]]) {
+        pos = skip_dns_name(data, pos)?;
+        let rr = data.get(pos..pos + 10)?;
+        let len = u16::from_be_bytes([rr[8], rr[9]]) as usize;
+        pos += 10;
+        let value = data.get(pos..pos + len)?;
+        if rr[..4] == [0, 1, 0, 1] && len == 4 {
+            let ip = IpAddr::V4(Ipv4Addr::new(value[0], value[1], value[2], value[3]));
+            if !ips.contains(&ip) { ips.push(ip); }
+        }
+        pos += len;
+    }
+    Some(ips)
+}
+
+fn query_doh_server(server: &str, port: u16, endpoint: &str, host: &str, wire: bool) -> Option<Vec<IpAddr>> {
     let Some(session) = winhttp_session() else {
-        return Vec::new();
+        return None;
     };
     let srv_w = wide(server);
-    let verb_w = wide("GET");
-    let path_w = wide(&format!("{endpoint}?name={host}&type=A"));
-    let hdr_w = wide("Accept: application/dns-json\r\n");
+    let payload = if wire { dns_question(host)? } else { Vec::new() };
+    let verb_w = wide(if wire { "POST" } else { "GET" });
+    let sep = if endpoint.contains('?') { '&' } else { '?' };
+    let path_w = if wire { wide(endpoint) } else { wide(&format!("{endpoint}{sep}name={host}&type=A")) };
+    let hdr_w = wide(if wire {
+        "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
+    } else { "Accept: application/dns-json\r\n" });
 
     unsafe {
-        let conn = WinHttpConnect(session, srv_w.as_ptr(), 443, 0);
+        let conn = WinHttpConnect(session, srv_w.as_ptr(), port, 0);
         if conn.is_null() {
-            return Vec::new();
+            return None;
         }
         let req = WinHttpOpenRequest(
             conn,
@@ -533,12 +629,12 @@ fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Vec<IpAddr> {
         );
         if req.is_null() {
             WinHttpCloseHandle(conn);
-            return Vec::new();
+            return None;
         }
 
         WinHttpSetTimeouts(req, 5000, 5000, 5000, 5000);
         let hdr_len = (hdr_w.len() - 1) as u32;
-        let sent = WinHttpSendRequest(req, hdr_w.as_ptr(), hdr_len, std::ptr::null(), 0, 0, 0);
+        let sent = WinHttpSendRequest(req, hdr_w.as_ptr(), hdr_len, payload.as_ptr().cast(), payload.len() as u32, payload.len() as u32, 0);
         let mut body = Vec::new();
         if sent != 0 && WinHttpReceiveResponse(req, std::ptr::null_mut()) != 0 {
             let mut avail: u32 = 0;
@@ -557,10 +653,7 @@ fn query_doh_server(server: &str, endpoint: &str, host: &str) -> Vec<IpAddr> {
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
 
-        match std::str::from_utf8(&body) {
-            Ok(text) => parse_doh_a_records(text),
-            Err(_) => Vec::new(),
-        }
+        if wire { wire_addresses(&body) } else { Some(parse_doh_a_records(std::str::from_utf8(&body).ok()?)) }
     }
 }
 
@@ -575,8 +668,11 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
     {
         return Vec::new();
     }
+    let provider = doh_provider();
+    let url = if provider == DohProvider::Custom { custom_url() } else { String::new() };
+    let cache_key = (provider.index(), url.clone(), host.to_owned());
     if let Some(map) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        if let Some((ips, t)) = map.get(host) {
+        if let Some((ips, t)) = map.get(&cache_key) {
             if t.elapsed() < Duration::from_secs(300) {
                 return ips.clone();
             }
@@ -584,8 +680,13 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
     }
 
     let mut ips = Vec::new();
-    for &(server, endpoint) in doh_provider().endpoints() {
-        ips = query_doh_server(server, endpoint, host);
+    if let Some((server, port, path)) = parse_endpoint(&url) {
+        ips = query_doh_server(server, port, path, host, true)
+            .or_else(|| query_doh_server(server, port, path, host, false))
+            .unwrap_or_default();
+    }
+    for &(server, endpoint) in provider.endpoints() {
+        ips = query_doh_server(server, 443, endpoint, host, false).unwrap_or_default();
         if !ips.is_empty() {
             break;
         }
@@ -595,7 +696,7 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(HashMap::new)
-            .insert(host.to_string(), (ips.clone(), Instant::now()));
+            .insert(cache_key, (ips.clone(), Instant::now()));
     }
     ips
 }
@@ -1278,12 +1379,33 @@ mod tests {
         assert_eq!(DohProvider::from_id("cloudflare"), DohProvider::Cloudflare);
         assert_eq!(DohProvider::from_id("GOOGLE"), DohProvider::Google);
         assert_eq!(DohProvider::from_id("adguard"), DohProvider::AdGuard);
-        assert_eq!(DohProvider::from_id("dnssb"), DohProvider::DnsSb);
+        assert_eq!(DohProvider::from_id("dnssb"), DohProvider::Custom);
         assert_eq!(DohProvider::from_id("unknown"), DohProvider::Cloudflare);
         for (i, p) in DohProvider::ALL.iter().enumerate() {
             assert_eq!(DohProvider::from_index(i), *p);
-            assert!(!p.endpoints().is_empty());
+            assert_eq!(p.endpoints().is_empty(), *p == DohProvider::Custom);
         }
+    }
+
+    #[test]
+    fn custom_endpoint_and_dns_message() {
+        assert_eq!(parse_endpoint("https://[::1]:8443/my/profile"), Some(("::1", 8443, "/my/profile")));
+        assert!(parse_endpoint("http://resolver.test/dns-query").is_none());
+        assert!(parse_endpoint("https://user@resolver.test/dns-query").is_none());
+        let mut reply = dns_question("example.org").unwrap();
+        reply[2] = 0x81;
+        reply[7] = 1;
+        reply.extend_from_slice(&[192, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert_eq!(wire_addresses(&reply), Some(vec![IpAddr::V4(Ipv4Addr::new(1,2,3,4))]));
+        reply.pop();
+        assert!(wire_addresses(&reply).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires network"]
+    fn live_custom_wire_doh() {
+        let ips = query_doh_server("dns.google", 443, "/dns-query", "example.org", true).unwrap();
+        assert!(!ips.is_empty());
     }
 
     #[test]

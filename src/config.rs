@@ -302,3 +302,19 @@ mod tests {
         assert_eq!(parse_stored_domains(&raw), list);
     }
 }
+
+pub fn light_theme() -> bool {
+    read_reg_sz(APP_KEY, "Theme").as_deref() == Some("light")
+}
+
+pub fn save_light_theme(light: bool) -> bool {
+    write_reg_sz(APP_KEY, "Theme", if light { "light" } else { "dark" })
+}
+
+pub fn load_doh_url() -> Option<String> {
+    read_reg_sz(APP_KEY, "CustomDohUrl")
+}
+
+pub fn save_doh_url(url: &str) -> bool {
+    write_reg_sz(APP_KEY, "CustomDohUrl", url)
+}

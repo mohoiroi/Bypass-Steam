@@ -6,6 +6,7 @@ mod gfx;
 mod proxy;
 mod theme;
 mod ui;
+mod update;
 
 use std::ptr::null;
 use windows_sys::Win32::UI::{

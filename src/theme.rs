@@ -86,3 +86,41 @@ pub const PAD_X: f32 = 24.0;
 pub const R_CARD: f32 = 10.0;
 pub const R_BTN: f32 = 8.0;
 pub const R_SM: f32 = 6.0;
+
+thread_local! {
+    static LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn is_light() -> bool { LIGHT.get() }
+pub fn set_light(light: bool) { LIGHT.set(light); }
+
+macro_rules! theme_color {
+    ($name:ident, $dark:ident, $light:expr) => {
+        pub fn $name() -> Color {
+            if is_light() {
+                Color::rgb(($light >> 16) as u8, ($light >> 8) as u8, $light as u8)
+            } else { $dark }
+        }
+    };
+}
+theme_color!(bg, BG, 0xf1f5f9_u32);
+theme_color!(surface, SURFACE, 0xffffff_u32);
+theme_color!(surface_inset, SURFACE_INSET, 0xf5f8fc_u32);
+theme_color!(surface_hover, SURFACE_HOVER, 0xe4edf6_u32);
+theme_color!(surface_elev, SURFACE_ELEV, 0xd5e1ed_u32);
+theme_color!(primary, PRIMARY, 0xdbeafe_u32);
+theme_color!(primary_hover, PRIMARY_HOVER, 0xcddff1_u32);
+theme_color!(btn_bg, BTN_BG, 0xebf1f7_u32);
+theme_color!(border, BORDER, 0xacbdce_u32);
+theme_color!(border_sub, BORDER_SUB, 0xd7e1eb_u32);
+theme_color!(text, TEXT, 0x142237_u32);
+theme_color!(text_sec, TEXT_SEC, 0x2d4056_u32);
+theme_color!(text_muted, TEXT_MUTED, 0x435972_u32);
+theme_color!(text_dim, TEXT_DIM, 0x52657a_u32);
+theme_color!(accent, ACCENT, 0x087342_u32);
+theme_color!(accent_hover, ACCENT_HOVER, 0x086037_u32);
+theme_color!(on_accent, ON_ACCENT, 0xffffff_u32);
+theme_color!(info, INFO, 0x006a94_u32);
+theme_color!(success, SUCCESS, 0x087342_u32);
+theme_color!(warning, WARNING, 0x885508_u32);
+theme_color!(danger, DANGER, 0xb72732_u32);
+theme_color!(neutral, NEUTRAL, 0x566a80_u32);
