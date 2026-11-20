@@ -19,10 +19,10 @@ use windows_sys::Win32::{
         Memory::{GlobalLock, GlobalUnlock},
     },
     UI::{
-        Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED},
+        Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
         Input::KeyboardAndMouse::{
-            GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
+            EnableWindow, GetFocus, GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
             VK_ESCAPE, VK_RETURN,
         },
         Shell::*,
@@ -1565,6 +1565,11 @@ fn toggle_direct_cdn_ui(hwnd: HWND) {
 
 const DOH_URL_FIELD: i32 = 202;
 const DOH_HELP: i32 = 205;
+const DOH_TEST: i32 = 206;
+const DOH_TEST_TIMER: usize = 1;
+const DOH_INVALID_URL: &str = "Nhập URL HTTPS đầy đủ, gồm tên máy chủ và đường dẫn DoH.";
+
+type DohProbeResult = Result<usize, proxy::DohError>;
 const DOH_EXAMPLE: &str = "Ví dụ: https://dns.google/dns-query";
 
 struct DohDialog {
@@ -1572,7 +1577,9 @@ struct DohDialog {
     fonts: FontSet,
     background: HBRUSH,
     input: HBRUSH,
-    invalid: std::cell::Cell<bool>,
+    help_color: std::cell::Cell<Color>,
+    probe: std::cell::RefCell<Option<std::sync::mpsc::Receiver<DohProbeResult>>>,
+    probe_matches_input: std::cell::Cell<bool>,
 }
 
 impl DohDialog {
@@ -1582,7 +1589,17 @@ impl DohDialog {
             fonts: FontSet::new(dpi),
             background: unsafe { CreateSolidBrush(theme::surface().colorref()) },
             input: unsafe { CreateSolidBrush(theme::surface_inset().colorref()) },
-            invalid: std::cell::Cell::new(false),
+            help_color: std::cell::Cell::new(theme::text_muted()),
+            probe: std::cell::RefCell::new(None),
+            probe_matches_input: std::cell::Cell::new(false),
+        }
+    }
+
+    fn show_help(&self, hwnd: HWND, message: &str, color: Color) {
+        self.help_color.set(color);
+        unsafe {
+            SetDlgItemTextW(hwnd, DOH_HELP, wide(message).as_ptr());
+            InvalidateRect(GetDlgItem(hwnd, DOH_HELP), null(), 1);
         }
     }
 }
@@ -1592,6 +1609,84 @@ impl Drop for DohDialog {
         unsafe {
             DeleteObject(self.background);
             DeleteObject(self.input);
+        }
+    }
+}
+
+fn doh_dialog_url(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 2050];
+    let len = unsafe { GetDlgItemTextW(hwnd, DOH_URL_FIELD, buf.as_mut_ptr(), buf.len() as i32) } as usize;
+    let value = String::from_utf16_lossy(&buf[..len]);
+    let url = value.trim();
+    if len >= 2049 || proxy::parse_endpoint(url).is_none() {
+        return None;
+    }
+    Some(url.to_owned())
+}
+
+fn doh_probe_error(error: proxy::DohError) -> String {
+    use proxy::DohError::*;
+    match error {
+        InvalidUrl => DOH_INVALID_URL.into(),
+        Certificate => "Không xác thực được chứng chỉ TLS của máy chủ.".into(),
+        Timeout => "Hết thời gian chờ phản hồi từ máy chủ DoH.".into(),
+        InvalidResponse => "Máy chủ trả về dữ liệu DoH không hợp lệ.".into(),
+        NoAddress => "Máy chủ phản hồi nhưng không trả về địa chỉ IPv4 cho example.org.".into(),
+        HttpStatus(code) => format!("Máy chủ trả về HTTP {code}. Hãy kiểm tra đường dẫn DoH."),
+        Connection(0) => "Không thể khởi tạo kết nối DoH.".into(),
+        Connection(code) => format!("Không thể kết nối tới máy chủ DoH (mã Windows {code})."),
+    }
+}
+
+fn start_doh_probe(hwnd: HWND, state: &DohDialog) {
+    if state.probe.borrow().is_some() {
+        return;
+    }
+    let Some(url) = doh_dialog_url(hwnd) else {
+        state.show_help(hwnd, DOH_INVALID_URL, theme::danger());
+        unsafe { SetFocus(GetDlgItem(hwnd, DOH_URL_FIELD)); }
+        return;
+    };
+
+    unsafe {
+        if SetTimer(hwnd, DOH_TEST_TIMER, 75, None) == 0 {
+            state.show_help(hwnd, "Không thể bắt đầu thử kết nối. Hãy thử lại.", theme::danger());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *state.probe.borrow_mut() = Some(rx);
+        state.probe_matches_input.set(true);
+        let button = GetDlgItem(hwnd, DOH_TEST);
+        if GetFocus() == button {
+            SetFocus(GetDlgItem(hwnd, DOH_URL_FIELD));
+        }
+        EnableWindow(button, 0);
+        state.show_help(hwnd, "Đang thử phân giải example.org…", theme::info());
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _ = tx.send(proxy::test_custom_doh(&url));
+        });
+    }
+}
+
+fn poll_doh_probe(hwnd: HWND, state: &DohDialog) {
+    use std::sync::mpsc::TryRecvError;
+    let result = state.probe.borrow().as_ref().map(|rx| rx.try_recv());
+    let result = match result {
+        Some(Ok(result)) => result,
+        Some(Err(TryRecvError::Disconnected)) => Err(proxy::DohError::Connection(0)),
+        _ => return,
+    };
+    state.probe.borrow_mut().take();
+    unsafe {
+        KillTimer(hwnd, DOH_TEST_TIMER);
+        EnableWindow(GetDlgItem(hwnd, DOH_TEST), 1);
+    }
+    if state.probe_matches_input.get() {
+        match result {
+            Ok(count) => state.show_help(
+                hwnd, &format!("Kết nối thành công · example.org trả về {count} địa chỉ IPv4."), theme::success(),
+            ),
+            Err(error) => state.show_help(hwnd, &doh_probe_error(error), theme::danger()),
         }
     }
 }
@@ -1610,6 +1705,7 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     (203, "Máy chủ DoH tùy chỉnh", state.fonts.title),
                     (204, "Địa chỉ máy chủ (HTTPS)", state.fonts.group),
                     (DOH_HELP, DOH_EXAMPLE, state.fonts.caption),
+                    (DOH_TEST, "Thử kết nối", state.fonts.badge),
                     (IDCANCEL, "Hủy", state.fonts.badge),
                     (IDOK, "Lưu và áp dụng", state.fonts.badge),
                 ];
@@ -1629,18 +1725,12 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 let hdc = wp as HDC;
                 let edit = msg == WM_CTLCOLOREDIT;
                 let hint = GetDlgCtrlID(lp as HWND) == DOH_HELP;
-                let color = if hint && (*state).invalid.get() {
-                    theme::danger()
-                } else if hint {
-                    theme::text_muted()
-                } else {
-                    theme::text()
-                };
+                let color = if hint { (*state).help_color.get() } else { theme::text() };
                 SetTextColor(hdc, color.colorref());
                 SetBkColor(hdc, if edit { theme::surface_inset() } else { theme::surface() }.colorref());
                 if edit { (*state).input as isize } else { (*state).background as isize }
             }
-            WM_DRAWITEM if !state.is_null() && (wp == IDOK as usize || wp == IDCANCEL as usize) => {
+            WM_DRAWITEM if !state.is_null() && matches!(wp as i32, IDOK | IDCANCEL | DOH_TEST) => {
                 let item = &*(lp as *const DRAWITEMSTRUCT);
                 let state = &*state;
                 let scale = state.dpi as f32 / 96.0;
@@ -1650,8 +1740,13 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     (bounds.right - bounds.left) as f32 / scale, (bounds.bottom - bounds.top) as f32 / scale);
                 let mut c = Canvas::new(item.hDC, state.dpi);
                 let primary = wp == IDOK as usize;
-                paint_utility_button(&mut c, &state.fonts, rect,
-                    if primary { "Lưu và áp dụng" } else { "Hủy" },
+                let label = match wp as i32 {
+                    IDOK => "Lưu và áp dụng",
+                    DOH_TEST if item.itemState & ODS_DISABLED != 0 => "Đang thử…",
+                    DOH_TEST => "Thử kết nối",
+                    _ => "Hủy",
+                };
+                paint_utility_button(&mut c, &state.fonts, rect, label,
                     primary, item.itemState & ODS_SELECTED != 0);
                 if item.itemState & ODS_FOCUS != 0 {
                     c.stroke_round_rect(RectF::new(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, rect.h - 6.0),
@@ -1659,31 +1754,33 @@ unsafe extern "system" fn custom_doh_dialog(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 }
                 1
             }
-            WM_COMMAND => match (wp & 0xffff) as i32 {
+            WM_TIMER if wp == DOH_TEST_TIMER && !state.is_null() => {
+                poll_doh_probe(hwnd, &*state);
+                1
+            }
+            WM_COMMAND if !state.is_null() => match (wp & 0xffff) as i32 {
                 IDOK => {
-                    let mut buf = vec![0u16; 2050];
-                    let len = GetDlgItemTextW(hwnd, DOH_URL_FIELD, buf.as_mut_ptr(), buf.len() as i32);
-                    let value = String::from_utf16_lossy(&buf[..len as usize]);
-                    let url = value.trim();
-                    let error = if len >= 2049 || proxy::parse_endpoint(url).is_none() {
-                        Some("Nhập URL HTTPS đầy đủ, gồm tên máy chủ và đường dẫn DoH.")
-                    } else if !proxy::save_custom_url(url) {
-                        Some("Không thể lưu địa chỉ máy chủ. Hãy thử lại.")
+                    let state = &*state;
+                    if let Some(url) = doh_dialog_url(hwnd) {
+                        if proxy::save_custom_url(&url) {
+                            EndDialog(hwnd, IDOK as isize);
+                        } else {
+                            state.show_help(hwnd, "Không thể lưu địa chỉ máy chủ. Hãy thử lại.", theme::danger());
+                        }
                     } else {
-                        None
-                    };
-                    if let Some(message) = error {
-                        if !state.is_null() { (*state).invalid.set(true); }
-                        SetDlgItemTextW(hwnd, DOH_HELP, wide(message).as_ptr());
+                        state.show_help(hwnd, DOH_INVALID_URL, theme::danger());
                         SetFocus(GetDlgItem(hwnd, DOH_URL_FIELD));
-                    } else {
-                        EndDialog(hwnd, IDOK as isize);
                     }
                     1
                 }
+                DOH_TEST => {
+                    start_doh_probe(hwnd, &*state);
+                    1
+                }
                 DOH_URL_FIELD if (wp >> 16) as u32 == EN_CHANGE => {
-                    if !state.is_null() { (*state).invalid.set(false); }
-                    SetDlgItemTextW(hwnd, DOH_HELP, wide(DOH_EXAMPLE).as_ptr());
+                    let state = &*state;
+                    state.probe_matches_input.set(false);
+                    state.show_help(hwnd, DOH_EXAMPLE, theme::text_muted());
                     1
                 }
                 IDCANCEL => { EndDialog(hwnd, IDCANCEL as isize); 1 }

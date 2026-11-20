@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::HWND,
+    Foundation::{GetLastError, HWND},
     Networking::{WinHttp::*, WinInet::*},
     System::Registry::*,
     UI::WindowsAndMessaging::{PostMessageW, WM_APP},
@@ -600,12 +600,58 @@ fn wire_addresses(data: &[u8]) -> Option<Vec<IpAddr>> {
     Some(ips)
 }
 
-fn query_doh_server(server: &str, port: u16, endpoint: &str, host: &str, wire: bool) -> Option<Vec<IpAddr>> {
-    let Some(session) = winhttp_session() else {
-        return None;
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DohError {
+    InvalidUrl,
+    Certificate,
+    Timeout,
+    InvalidResponse,
+    NoAddress,
+    HttpStatus(u32),
+    Connection(u32),
+}
+
+impl DohError {
+    fn from_winhttp(code: u32) -> Self {
+        match code {
+            ERROR_WINHTTP_TIMEOUT => Self::Timeout,
+            ERROR_WINHTTP_SECURE_FAILURE
+            | ERROR_WINHTTP_SECURE_CERT_CN_INVALID
+            | ERROR_WINHTTP_SECURE_CERT_DATE_INVALID
+            | ERROR_WINHTTP_SECURE_CERT_REVOKED
+            | ERROR_WINHTTP_SECURE_CERT_REV_FAILED
+            | ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE
+            | ERROR_WINHTTP_SECURE_INVALID_CA
+            | ERROR_WINHTTP_SECURE_INVALID_CERT
+            | ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED => Self::Certificate,
+            ERROR_WINHTTP_INVALID_SERVER_RESPONSE => Self::InvalidResponse,
+            _ => Self::Connection(code),
+        }
+    }
+
+    fn last() -> Self {
+        Self::from_winhttp(unsafe { GetLastError() })
+    }
+}
+
+struct DohHandle(*mut core::ffi::c_void);
+
+impl DohHandle {
+    fn checked(handle: *mut core::ffi::c_void) -> Result<Self, DohError> {
+        if handle.is_null() { Err(DohError::last()) } else { Ok(Self(handle)) }
+    }
+}
+
+impl Drop for DohHandle {
+    fn drop(&mut self) {
+        unsafe { WinHttpCloseHandle(self.0); }
+    }
+}
+
+fn query_doh_server(server: &str, port: u16, endpoint: &str, host: &str, wire: bool) -> Result<Vec<IpAddr>, DohError> {
+    let session = winhttp_session().ok_or(DohError::Connection(0))?;
     let srv_w = wide(server);
-    let payload = if wire { dns_question(host)? } else { Vec::new() };
+    let payload = if wire { dns_question(host).ok_or(DohError::InvalidResponse)? } else { Vec::new() };
     let verb_w = wide(if wire { "POST" } else { "GET" });
     let sep = if endpoint.contains('?') { '&' } else { '?' };
     let path_w = if wire { wide(endpoint) } else { wide(&format!("{endpoint}{sep}name={host}&type=A")) };
@@ -613,48 +659,95 @@ fn query_doh_server(server: &str, port: u16, endpoint: &str, host: &str, wire: b
         "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
     } else { "Accept: application/dns-json\r\n" });
 
+    let mut body = Vec::new();
     unsafe {
-        let conn = WinHttpConnect(session, srv_w.as_ptr(), port, 0);
-        if conn.is_null() {
-            return None;
-        }
-        let req = WinHttpOpenRequest(
-            conn,
+        let conn = DohHandle::checked(WinHttpConnect(session, srv_w.as_ptr(), port, 0))?;
+        let req = DohHandle::checked(WinHttpOpenRequest(
+            conn.0,
             verb_w.as_ptr(),
             path_w.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
             WINHTTP_FLAG_SECURE,
-        );
-        if req.is_null() {
-            WinHttpCloseHandle(conn);
+        ))?;
+        if WinHttpSetTimeouts(req.0, 5000, 5000, 5000, 5000) == 0 {
+            return Err(DohError::last());
+        }
+        let started = Instant::now();
+        let payload_len = payload.len() as u32;
+        if WinHttpSendRequest(
+            req.0, hdr_w.as_ptr(), (hdr_w.len() - 1) as u32,
+            payload.as_ptr().cast(), payload_len, payload_len, 0,
+        ) == 0 || WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
+            return Err(DohError::last());
+        }
+        let mut status = 0u32;
+        let mut status_len = std::mem::size_of_val(&status) as u32;
+        if WinHttpQueryHeaders(
+            req.0, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, std::ptr::null(),
+            (&mut status as *mut u32).cast(), &mut status_len, std::ptr::null_mut(),
+        ) == 0 {
+            return Err(DohError::last());
+        }
+        if !(200..300).contains(&status) {
+            return Err(DohError::HttpStatus(status));
+        }
+
+        let mut chunk = [0u8; 8192];
+        loop {
+            let mut read = 0;
+            if WinHttpReadData(req.0, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut read) == 0 {
+                return Err(DohError::last());
+            }
+            if started.elapsed() >= Duration::from_secs(12) {
+                return Err(DohError::Timeout);
+            }
+            if read == 0 { break; }
+            if body.len() + read as usize > 65536 {
+                return Err(DohError::InvalidResponse);
+            }
+            body.extend_from_slice(&chunk[..read as usize]);
+        }
+    }
+
+    if wire {
+        wire_addresses(&body).ok_or(DohError::InvalidResponse)
+    } else {
+        json_doh_addresses(&body).ok_or(DohError::InvalidResponse)
+    }
+}
+
+fn json_doh_addresses(body: &[u8]) -> Option<Vec<IpAddr>> {
+    let json = std::str::from_utf8(body).ok()?.trim();
+    if !json.starts_with('{') || find_matching_delim(json, b'{', b'}')? + 1 != json.len() {
+        return None;
+    }
+    let status = json[find_json_key(json, "Status")?..].trim_start();
+    let status = status.split([',', '}']).next()?.trim().parse::<u16>().ok()?;
+
+    if let Some(index) = find_json_key(json, "Answer") {
+        let answer = json[index..].trim_start();
+        if !answer.starts_with('[') || find_matching_delim(answer, b'[', b']').is_none() {
             return None;
         }
-
-        WinHttpSetTimeouts(req, 5000, 5000, 5000, 5000);
-        let hdr_len = (hdr_w.len() - 1) as u32;
-        let sent = WinHttpSendRequest(req, hdr_w.as_ptr(), hdr_len, payload.as_ptr().cast(), payload.len() as u32, payload.len() as u32, 0);
-        let mut body = Vec::new();
-        if sent != 0 && WinHttpReceiveResponse(req, std::ptr::null_mut()) != 0 {
-            let mut avail: u32 = 0;
-            while WinHttpQueryDataAvailable(req, &mut avail) != 0 && avail > 0 {
-                let mut chunk = vec![0u8; (avail as usize).min(16384)];
-                let mut read: u32 = 0;
-                if WinHttpReadData(req, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut read) == 0 || read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read as usize]);
-                if body.len() > 65536 {
-                    break;
-                }
-            }
-        }
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-
-        if wire { wire_addresses(&body) } else { Some(parse_doh_a_records(std::str::from_utf8(&body).ok()?)) }
     }
+    Some(if status == 0 { parse_doh_a_records(json) } else { Vec::new() })
+}
+
+fn query_custom_doh(server: &str, port: u16, path: &str, host: &str) -> Result<Vec<IpAddr>, DohError> {
+    match query_doh_server(server, port, path, host, true) {
+        Err(DohError::InvalidResponse | DohError::HttpStatus(_)) => {
+            query_doh_server(server, port, path, host, false)
+        }
+        result => result,
+    }
+}
+
+pub fn test_custom_doh(url: &str) -> Result<usize, DohError> {
+    let (server, port, path) = parse_endpoint(url).ok_or(DohError::InvalidUrl)?;
+    let addresses = query_custom_doh(server, port, path, "example.org")?;
+    if addresses.is_empty() { Err(DohError::NoAddress) } else { Ok(addresses.len()) }
 }
 
 pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
@@ -681,9 +774,7 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
 
     let mut ips = Vec::new();
     if let Some((server, port, path)) = parse_endpoint(&url) {
-        ips = query_doh_server(server, port, path, host, true)
-            .or_else(|| query_doh_server(server, port, path, host, false))
-            .unwrap_or_default();
+        ips = query_custom_doh(server, port, path, host).unwrap_or_default();
     }
     for &(server, endpoint) in provider.endpoints() {
         ips = query_doh_server(server, 443, endpoint, host, false).unwrap_or_default();
@@ -1402,10 +1493,22 @@ mod tests {
     }
 
     #[test]
+    fn reports_certificate_timeout_and_invalid_doh_response() {
+        assert_eq!(DohError::from_winhttp(ERROR_WINHTTP_SECURE_INVALID_CA), DohError::Certificate);
+        assert_eq!(DohError::from_winhttp(ERROR_WINHTTP_TIMEOUT), DohError::Timeout);
+        assert_eq!(DohError::from_winhttp(ERROR_WINHTTP_INVALID_SERVER_RESPONSE), DohError::InvalidResponse);
+        assert!(json_doh_addresses(b"<html></html>").is_none());
+        assert!(json_doh_addresses(br#"{"Status":0,"Answer":"invalid"}"#).is_none());
+        assert_eq!(json_doh_addresses(br#"{"Status":3}"#), Some(Vec::new()));
+        assert_eq!(test_custom_doh("http://example.org/dns-query"), Err(DohError::InvalidUrl));
+    }
+
+    #[test]
     #[ignore = "requires network"]
-    fn live_custom_wire_doh() {
-        let ips = query_doh_server("dns.google", 443, "/dns-query", "example.org", true).unwrap();
-        assert!(!ips.is_empty());
+    fn live_custom_doh_probe_supports_wire_and_json() {
+        for url in ["https://dns.google/dns-query", "https://dns.google/resolve"] {
+            assert!(test_custom_doh(url).unwrap() > 0, "{url}");
+        }
     }
 
     #[test]

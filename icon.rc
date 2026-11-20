@@ -10,6 +10,7 @@ BEGIN
     LTEXT "", 204, 12, 30, 270, 12
     EDITTEXT 202, 12, 44, 270, 19, 0x0080
     LTEXT "", 205, 12, 69, 270, 24
+    PUSHBUTTON "Test connection", 206, 12, 101, 100, 20, 0x000B
     PUSHBUTTON "Cancel", 2, 156, 101, 60, 20, 0x000B
     PUSHBUTTON "Save", 1, 222, 101, 60, 20, 0x000B
 END
