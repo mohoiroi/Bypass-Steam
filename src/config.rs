@@ -1,16 +1,24 @@
 //! Persistent configuration in HKCU Registry: Windows autostart, Direct CDN, and custom domains.
 
-use crate::proxy::wide;
-use std::ptr::null_mut;
+use crate::proxy::{DohProvider, is_builtin_domain, parse_endpoint, wide};
+use std::{
+    collections::HashSet,
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::Path,
+    ptr::null_mut,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows_sys::Win32::System::Registry::*;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "SteamBypass";
 
-const APP_KEY: &str = r"Software\SteamBypass";
-const CUSTOM_DOMAINS_VALUE: &str = "CustomDomains";
-const DIRECT_CDN_VALUE: &str = "DirectCdn";
-const DOH_PROVIDER_VALUE: &str = "DohProvider";
+pub(crate) const APP_KEY: &str = r"Software\SteamBypass";
+const SETTINGS_VALUE: &str = "PortableSettings";
+const BACKUP_HEADER: &str = "Steam Bypass Settings v1";
+const BACKUP_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomDomain {
@@ -19,14 +27,21 @@ pub struct CustomDomain {
 }
 
 fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
+    let (kind, data) = read_reg_string(subkey, value_name).ok()??;
+    (kind == REG_SZ).then_some(data)
+}
+
+pub(crate) fn read_reg_string(subkey: &str, value_name: &str) -> Result<Option<(u32, String)>, ()> {
     let key_w = wide(subkey);
     let name_w = wide(value_name);
     unsafe {
         let mut hkey: HKEY = null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, key_w.as_ptr(), 0, KEY_READ, &mut hkey) != 0
-            || hkey.is_null()
-        {
-            return None;
+        let rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey);
+        if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != 0 {
+            return Err(());
         }
         let mut reg_type: u32 = 0;
         let mut size_bytes: u32 = 0;
@@ -38,9 +53,9 @@ fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
             null_mut(),
             &mut size_bytes,
         );
-        if rc != 0 || reg_type != REG_SZ || size_bytes < 2 {
+        if rc != 0 || !matches!(reg_type, REG_SZ | REG_EXPAND_SZ) {
             RegCloseKey(hkey);
-            return None;
+            return if rc == ERROR_FILE_NOT_FOUND { Ok(None) } else { Err(()) };
         }
         let mut buf = vec![0u16; (size_bytes as usize + 1) / 2];
         let mut actual = (buf.len() * 2) as u32;
@@ -53,8 +68,8 @@ fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
             &mut actual,
         );
         RegCloseKey(hkey);
-        if rc2 != 0 {
-            return None;
+        if rc2 != 0 || !matches!(reg_type, REG_SZ | REG_EXPAND_SZ) {
+            return Err(());
         }
         let len = (actual as usize / 2).min(buf.len());
         let slice = &buf[..len];
@@ -62,11 +77,15 @@ fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
             Some(pos) => &slice[..pos],
             None => slice,
         };
-        Some(String::from_utf16_lossy(trimmed))
+        Ok(Some((reg_type, String::from_utf16(trimmed).map_err(|_| ())?)))
     }
 }
 
 fn write_reg_sz(subkey: &str, value_name: &str, value: &str) -> bool {
+    write_reg_string(subkey, value_name, REG_SZ, value)
+}
+
+pub(crate) fn write_reg_string(subkey: &str, value_name: &str, kind: u32, value: &str) -> bool {
     let key_w = wide(subkey);
     let name_w = wide(value_name);
     let val_w = wide(value);
@@ -80,7 +99,7 @@ fn write_reg_sz(subkey: &str, value_name: &str, value: &str) -> bool {
             hkey,
             name_w.as_ptr(),
             0,
-            REG_SZ,
+            kind,
             val_w.as_ptr().cast(),
             (val_w.len() * 2) as u32,
         ) == 0;
@@ -89,15 +108,17 @@ fn write_reg_sz(subkey: &str, value_name: &str, value: &str) -> bool {
     }
 }
 
-fn delete_reg_value(subkey: &str, value_name: &str) -> bool {
+pub(crate) fn delete_reg_value(subkey: &str, value_name: &str) -> bool {
     let key_w = wide(subkey);
     let name_w = wide(value_name);
     unsafe {
         let mut hkey: HKEY = null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, key_w.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != 0
-            || hkey.is_null()
-        {
+        let rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.as_ptr(), 0, KEY_SET_VALUE, &mut hkey);
+        if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
             return true;
+        }
+        if rc != 0 {
+            return false;
         }
         let rc = RegDeleteValueW(hkey, name_w.as_ptr());
         RegCloseKey(hkey);
@@ -130,26 +151,143 @@ pub fn sync_autostart_path() {
     }
 }
 
-// ---------------- Direct CDN Toggle ----------------
-pub fn load_direct_cdn() -> bool {
-    read_reg_sz(APP_KEY, DIRECT_CDN_VALUE)
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+#[derive(Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub domains: Vec<CustomDomain>,
+    pub provider: DohProvider,
+    pub url: String,
+    pub direct_cdn: bool,
+    pub light: bool,
+}
+
+impl Settings {
+    pub fn load() -> Self {
+        if let Some(text) = read_reg_sz(APP_KEY, SETTINGS_VALUE) {
+            if let Ok(settings) = Self::decode(&text) {
+                return settings;
+            }
+        }
+        let id = read_reg_sz(APP_KEY, "DohProvider").unwrap_or_default();
+        let mut provider = DohProvider::from_id(&id);
+        let url = read_reg_sz(APP_KEY, "CustomDohUrl")
+            .or_else(|| (id.trim().eq_ignore_ascii_case("dnssb")).then(|| "https://doh.dns.sb/dns-query".into()))
+            .filter(|url| parse_endpoint(url).is_some())
+            .unwrap_or_default();
+        if provider == DohProvider::Custom && url.is_empty() {
+            provider = DohProvider::Cloudflare;
+        }
+        Self {
+            domains: parse_stored_domains(&read_reg_sz(APP_KEY, "CustomDomains").unwrap_or_default())
+                .into_iter()
+                .filter(|item| !is_builtin_domain(&item.domain))
+                .collect(),
+            provider,
+            url,
+            direct_cdn: read_reg_sz(APP_KEY, "DirectCdn").is_some_and(|value| value.trim() == "1"),
+            light: read_reg_sz(APP_KEY, "Theme").as_deref() == Some("light"),
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{BACKUP_HEADER}\nDoH={}\nURL={}\nDirectCDN={}\nTheme={}\n[Domains]\n{}",
+            self.provider.id(),
+            self.url,
+            u8::from(self.direct_cdn),
+            if self.light { "light" } else { "dark" },
+            serialize_stored_domains(&self.domains),
+        )
+    }
+
+    pub fn decode(text: &str) -> Result<Self, &'static str> {
+        if text.len() > BACKUP_LIMIT {
+            return Err("Tệp sao lưu vượt quá 1 MB.");
+        }
+        let mut lines = text.trim_start_matches('\u{feff}').lines();
+        if lines.next() != Some(BACKUP_HEADER) {
+            return Err("Tệp không phải bản sao lưu Steam Bypass được hỗ trợ.");
+        }
+        let invalid = "Tệp sao lưu có cấu hình không hợp lệ.";
+        let id = lines.next().and_then(|s| s.strip_prefix("DoH=")).ok_or(invalid)?;
+        let provider = DohProvider::ALL.into_iter().find(|p| p.id() == id).ok_or(invalid)?;
+        let url = lines.next().and_then(|s| s.strip_prefix("URL=")).ok_or(invalid)?;
+        if (provider == DohProvider::Custom || !url.is_empty()) && parse_endpoint(url).is_none() {
+            return Err("Địa chỉ Custom DoH trong bản sao lưu không hợp lệ.");
+        }
+        let direct_cdn = match lines.next() {
+            Some("DirectCDN=1") => true,
+            Some("DirectCDN=0") => false,
+            _ => return Err(invalid),
+        };
+        let light = match lines.next() {
+            Some("Theme=light") => true,
+            Some("Theme=dark") => false,
+            _ => return Err(invalid),
+        };
+        if lines.next() != Some("[Domains]") {
+            return Err(invalid);
+        }
+        let mut seen = HashSet::new();
+        let mut domains = Vec::new();
+        for line in lines {
+            let (domain, enabled) = line.strip_prefix('!').map_or((line, true), |host| (host, false));
+            if validate_domain(domain).is_err()
+                || is_builtin_domain(domain)
+                || !seen.insert(domain)
+            {
+                return Err("Danh sách trong bản sao lưu chứa tên miền không hợp lệ hoặc trùng lặp.");
+            }
+            domains.push(CustomDomain { domain: domain.into(), enabled });
+        }
+        Ok(Self { domains, provider, url: url.into(), direct_cdn, light })
+    }
+
+    pub fn save(&self) -> bool {
+        let text = self.encode();
+        text.len() <= BACKUP_LIMIT && write_reg_sz(APP_KEY, SETTINGS_VALUE, &text)
+    }
+
+    pub fn read_backup(path: &Path) -> Result<Self, &'static str> {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| file.take((BACKUP_LIMIT + 1) as u64).read_to_end(&mut bytes))
+            .map_err(|_| "Không thể đọc tệp sao lưu.")?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| "Tệp sao lưu phải dùng mã hóa UTF-8.")?;
+        Self::decode(text)
+    }
+
+    pub fn write_backup(&self, path: &Path) -> io::Result<()> {
+        let text = self.encode();
+        if text.len() > BACKUP_LIMIT {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Backup is too large"));
+        }
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let temporary = path.with_file_name(format!(".steam-bypass-{}-{stamp}.tmp", std::process::id()));
+        let mut file = File::create_new(&temporary)?;
+        let result = file.write_all(text.as_bytes()).and_then(|_| file.sync_all());
+        drop(file);
+
+        // Keep the previous backup intact if writing or replacing the file fails.
+        let result = result.and_then(|_| fs::rename(&temporary, path));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn change_settings(change: impl FnOnce(&mut Settings)) -> bool {
+    let mut settings = Settings::load();
+    change(&mut settings);
+    settings.save()
 }
 
 pub fn save_direct_cdn(direct: bool) -> bool {
-    write_reg_sz(APP_KEY, DIRECT_CDN_VALUE, if direct { "1" } else { "0" })
+    change_settings(|s| s.direct_cdn = direct)
 }
 
-// ---------------- DoH Provider ----------------
-pub fn load_doh_provider() -> Option<String> {
-    read_reg_sz(APP_KEY, DOH_PROVIDER_VALUE)
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-}
-
-pub fn save_doh_provider(id: &str) -> bool {
-    write_reg_sz(APP_KEY, DOH_PROVIDER_VALUE, id)
+pub fn save_doh_provider(provider: DohProvider) -> bool {
+    change_settings(|s| s.provider = provider)
 }
 
 // ---------------- Custom Domains ----------------
@@ -192,6 +330,11 @@ pub fn normalize_domain(raw: &str) -> Result<String, &'static str> {
         _ => s,
     };
 
+    validate_domain(s)?;
+    Ok(s.to_string())
+}
+
+fn validate_domain(s: &str) -> Result<(), &'static str> {
     if s.len() < 3 || s.len() > 253 || !s.contains('.') {
         return Err("Tên miền không hợp lệ (vd: bbc.com)");
     }
@@ -215,7 +358,7 @@ pub fn normalize_domain(raw: &str) -> Result<String, &'static str> {
     if tld.len() < 2 || !tld.bytes().any(|b| b.is_ascii_alphabetic()) {
         return Err("Đuôi tên miền không hợp lệ");
     }
-    Ok(s.to_string())
+    Ok(())
 }
 
 pub(crate) fn parse_stored_domains(raw: &str) -> Vec<CustomDomain> {
@@ -252,16 +395,8 @@ pub(crate) fn serialize_stored_domains(domains: &[CustomDomain]) -> String {
         .join("\n")
 }
 
-pub fn load_custom_domains() -> Vec<CustomDomain> {
-    let Some(raw) = read_reg_sz(APP_KEY, CUSTOM_DOMAINS_VALUE) else {
-        return Vec::new();
-    };
-    parse_stored_domains(&raw)
-}
-
 pub fn save_custom_domains(domains: &[CustomDomain]) -> bool {
-    let joined = serialize_stored_domains(domains);
-    write_reg_sz(APP_KEY, CUSTOM_DOMAINS_VALUE, &joined)
+    change_settings(|s| s.domains = domains.to_vec())
 }
 
 #[cfg(test)]
@@ -301,20 +436,49 @@ mod tests {
         assert_eq!(raw, "bbc.com\n!medium.com");
         assert_eq!(parse_stored_domains(&raw), list);
     }
-}
 
-pub fn light_theme() -> bool {
-    read_reg_sz(APP_KEY, "Theme").as_deref() == Some("light")
+    #[test]
+    fn backup_round_trip_and_validation() {
+        let mut settings = Settings {
+            domains: vec![
+                CustomDomain { domain: "example.test".into(), enabled: true },
+                CustomDomain { domain: "news.example.test".into(), enabled: false },
+            ],
+            provider: DohProvider::Custom,
+            url: "https://resolver.test/dns-query?profile=private".into(),
+            direct_cdn: true,
+            light: true,
+        };
+        let data = settings.encode();
+        assert_eq!(Settings::decode(&data), Ok(settings));
+        assert!(Settings::decode(&format!("{data}\nnews.example.test")).is_err());
+        assert!(Settings::decode(&data.replace("https://", "http://")).is_err());
+        assert!(Settings::decode(&data.replace("v1", "v2")).is_err());
+        assert!(Settings::decode(&data.replace("example.test", "steampowered.com")).is_err());
+        settings = Settings::decode(&data).unwrap();
+
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("backup-test-{}-cấu hình.sbconf", std::process::id()));
+        struct BackupFile(std::path::PathBuf);
+        impl Drop for BackupFile {
+            fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        }
+        let file = BackupFile(path);
+        settings.write_backup(&file.0).unwrap();
+        assert_eq!(&Settings::read_backup(&file.0).unwrap(), &settings);
+
+        settings.domains.clear();
+        settings.write_backup(&file.0).unwrap();
+        assert_eq!(&Settings::read_backup(&file.0).unwrap(), &settings);
+        assert_eq!(Settings::decode(&settings.encode()), Ok(settings));
+    }
 }
 
 pub fn save_light_theme(light: bool) -> bool {
-    write_reg_sz(APP_KEY, "Theme", if light { "light" } else { "dark" })
-}
-
-pub fn load_doh_url() -> Option<String> {
-    read_reg_sz(APP_KEY, "CustomDohUrl")
+    change_settings(|s| s.light = light)
 }
 
 pub fn save_doh_url(url: &str) -> bool {
-    write_reg_sz(APP_KEY, "CustomDohUrl", url)
+    change_settings(|s| s.url = url.into())
 }

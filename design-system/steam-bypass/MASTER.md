@@ -17,9 +17,13 @@
 
 The 832 × 468 DIP window opens with Steam selected. The connection panel is 210–228 DIP wide and aligns with the workspace at the top and bottom. The clickable proxy control stacks the status, address and switch on the panel's centerline. A divider separates the two centered metrics below the control. A small unit label follows the latency value. The DoH selector, connection check and feedback form a section at the bottom. The connected status dot uses green.
 
-The DoH menu aligns provider names and addresses in separate columns, with a checkmark on the selected provider. Custom DoH opens a compact 234 × 94 dialog-unit form. Feedback sits below the URL field. The footer actions are Hủy, Thử kết nối and Lưu và áp dụng in that order.
+The DoH selector opens a compact rounded panel above the button. Each provider shows its name and a smaller, muted address aligned to the right on the same line. The active name uses blue text, and a divider leads to the one-line Custom DoH action. The arrow keys browse the list and Escape returns focus to the selector. Custom DoH opens a compact 234 × 94 dialog-unit form. Feedback sits below the URL field. The footer actions are Hủy, Thử kết nối and Lưu và áp dụng in that order.
 
 The right pane has tabs for Steam, Web khác and Tiện ích. Steam uses 48 DIP service rows with a separate line for descriptions. Expand a group to see per-host details. Web khác contains domain management. Tiện ích uses switches for CDN, startup and dark mode, with a separate button for checking updates. The shared pane footer places Thoát at the lower right on every tab. The window supports both columns down to 716 × 440 DIP.
+
+The selected tab background and the switch thumbs in Kết nối and Tiện ích ease in and out over 220 ms. Text and hit targets use fixed positions during each transition. The app follows the Windows animation preference.
+
+Tiện ích places configuration backup in one row with Xuất tệp and Nhập tệp as adjacent outline buttons. Windows owns file selection and overwrite confirmation. Import shows the number of domains and asks before replacing settings. The shared pane footer reports backup and startup recovery outcomes.
 
 The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The Windows app icon uses a white bypass arrow on a solid black tile. The runtime theme file owns the desktop colors and sizes.
 

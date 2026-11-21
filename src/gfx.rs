@@ -155,6 +155,46 @@ impl Drop for FontSet {
     }
 }
 
+pub struct PaintBuffer {
+    pub dc: HDC,
+    pub size: (i32, i32),
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+}
+
+impl PaintBuffer {
+    pub fn new(target: HDC, width: i32, height: i32) -> Option<Self> {
+        unsafe {
+            let dc = CreateCompatibleDC(target);
+            if dc.is_null() {
+                return None;
+            }
+            let bitmap = CreateCompatibleBitmap(target, width, height);
+            if bitmap.is_null() {
+                DeleteDC(dc);
+                return None;
+            }
+            let previous = SelectObject(dc, bitmap as HGDIOBJ);
+            if previous.is_null() {
+                DeleteObject(bitmap as HGDIOBJ);
+                DeleteDC(dc);
+                return None;
+            }
+            Some(Self { dc, size: (width, height), bitmap, previous })
+        }
+    }
+}
+
+impl Drop for PaintBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap as HGDIOBJ);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
 pub struct Canvas {
     hdc: HDC,
     gp: *mut GpGraphics,
@@ -387,30 +427,6 @@ impl Canvas {
         unsafe {
             let mut pen: *mut GpPen = null_mut();
             GdipCreatePen1(color.argb(), 1.6 * s, UnitPixel, &mut pen);
-            if !pen.is_null() {
-                GdipSetPenStartCap(pen, LineCapRound);
-                GdipSetPenEndCap(pen, LineCapRound);
-                GdipSetPenLineJoin(pen, LineJoinRound);
-                GdipDrawLines(gp, pen, pts.as_ptr(), 3);
-                GdipDeletePen(pen);
-            }
-        }
-    }
-
-    pub fn draw_checkmark(&mut self, cx: f32, cy: f32, size: f32, width: f32, color: Color) {
-        let gp = self.ensure_gp();
-        if gp.is_null() {
-            return;
-        }
-        let s = self.scale;
-        let pts = [
-            PointF { X: (cx - size * 0.42) * s, Y: (cy + size * 0.02) * s },
-            PointF { X: (cx - size * 0.10) * s, Y: (cy + size * 0.34) * s },
-            PointF { X: (cx + size * 0.44) * s, Y: (cy - size * 0.32) * s },
-        ];
-        unsafe {
-            let mut pen: *mut GpPen = null_mut();
-            GdipCreatePen1(color.argb(), width * s, UnitPixel, &mut pen);
             if !pen.is_null() {
                 GdipSetPenStartCap(pen, LineCapRound);
                 GdipSetPenEndCap(pen, LineCapRound);

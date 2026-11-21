@@ -1,6 +1,6 @@
 //! Local HTTP/HTTPS proxy with DNS-over-HTTPS (WinHTTP) and TLS ClientHello splitting.
 
-use crate::config::CustomDomain;
+use crate::{config::{CustomDomain, Settings}, pac};
 use std::{
     collections::{BTreeMap, HashMap},
     io::{Read, Write},
@@ -14,8 +14,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND},
-    Networking::{WinHttp::*, WinInet::*},
-    System::Registry::*,
+    Networking::WinHttp::*,
     UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
@@ -28,8 +27,6 @@ pub const APP_TITLE: &str = "Steam Bypass";
 pub const PORT: u16 = 8899;
 pub const WM_APP_STATS: u32 = WM_APP + 2;
 pub const WM_APP_NET_CHANGED: u32 = WM_APP + 5;
-
-const IE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 const DOMAINS: &[&str] = &[
     "steampowered.com",
@@ -71,10 +68,6 @@ impl DohProvider {
             "custom" | "dnssb" => Self::Custom,
             _ => Self::Cloudflare,
         }
-    }
-
-    pub fn from_index(idx: usize) -> Self {
-        Self::ALL.get(idx).copied().unwrap_or(Self::Cloudflare)
     }
 
     pub const fn index(self) -> usize {
@@ -216,12 +209,13 @@ pub struct Stat {
 
 pub static STATS: Mutex<BTreeMap<String, Stat>> = Mutex::new(BTreeMap::new());
 pub static CUSTOM_DOMAINS: Mutex<Vec<CustomDomain>> = Mutex::new(Vec::new());
-pub static ENABLED: AtomicBool = AtomicBool::new(true);
+pub static ENABLED: AtomicBool = AtomicBool::new(false);
 pub static DIRECT_CDN: AtomicBool = AtomicBool::new(false);
-pub static DOH_PROVIDER: AtomicUsize = AtomicUsize::new(0);
 pub static PENDING: AtomicUsize = AtomicUsize::new(0);
 
-static PAC_VERSION: AtomicUsize = AtomicUsize::new(1);
+static PAC_UPDATE: Mutex<()> = Mutex::new(());
+static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_SESSIONS: Mutex<BTreeMap<usize, ProxySession>> = Mutex::new(BTreeMap::new());
 static UI_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static UI_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -252,30 +246,30 @@ pub fn clear_dns_cache() {
     }
 }
 
-pub fn init_settings() {
-    DIRECT_CDN.store(crate::config::load_direct_cdn(), Ordering::SeqCst);
-    let stored = crate::config::load_doh_provider();
-    let saved_url = crate::config::load_doh_url().or_else(|| {
-        (stored.as_deref() == Some("dnssb")).then(|| "https://doh.dns.sb/dns-query".to_string())
-    }).unwrap_or_default();
-    *CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()) = saved_url;
-    let provider = stored
-        .map(|id| DohProvider::from_id(&id))
-        .filter(|p| *p != DohProvider::Custom || parse_endpoint(&custom_url()).is_some())
-        .unwrap_or(DohProvider::Cloudflare);
-    DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
-    let loaded = crate::config::load_custom_domains();
-    let mut list = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
-    *list = loaded;
+pub fn apply_settings(settings: Settings) {
+    *DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = (settings.provider, settings.url);
+    {
+        let mut domains = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+        DIRECT_CDN.store(settings.direct_cdn, Ordering::SeqCst);
+        *domains = settings.domains;
+        STATS.lock().unwrap_or_else(|e| e.into_inner()).retain(|host, stat| {
+            stat.group != CUSTOM_GROUP_IDX || domains.iter().any(|item| domain_matches(host, &item.domain))
+        });
+    }
+    clear_dns_cache();
+    seed_stats();
+    refresh_pac();
+    disconnect_disallowed_sessions();
+    notify_ui();
 }
 
 pub fn doh_provider() -> DohProvider {
-    DohProvider::from_index(DOH_PROVIDER.load(Ordering::SeqCst))
+    DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).0
 }
 
 pub fn set_doh_provider(provider: DohProvider) -> bool {
-    if !crate::config::save_doh_provider(provider.id()) { return false; }
-    DOH_PROVIDER.store(provider.index(), Ordering::SeqCst);
+    if !crate::config::save_doh_provider(provider) { return false; }
+    DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).0 = provider;
 
     clear_dns_cache();
     notify_ui();
@@ -285,9 +279,10 @@ pub fn set_doh_provider(provider: DohProvider) -> bool {
 pub fn set_direct_cdn(direct: bool) {
     DIRECT_CDN.store(direct, Ordering::SeqCst);
     let _ = crate::config::save_direct_cdn(direct);
-    if ENABLED.load(Ordering::SeqCst) {
-        set_pac(true);
+    if direct {
+        disconnect_disallowed_sessions();
     }
+    refresh_pac();
     notify_ui();
 }
 
@@ -359,9 +354,7 @@ pub fn add_custom_domains(raw: &str) -> BatchAddResult {
                 });
             }
         }
-        if ENABLED.load(Ordering::SeqCst) {
-            set_pac(true);
-        }
+        refresh_pac();
         for d in &newly_added {
             test_single_host(d.clone());
         }
@@ -381,9 +374,10 @@ pub fn toggle_custom_domain(domain: &str) -> Option<bool> {
         new_state = item.enabled;
         let _ = crate::config::save_custom_domains(&list);
     }
-    if ENABLED.load(Ordering::SeqCst) {
-        set_pac(true);
+    if !new_state {
+        disconnect_disallowed_sessions();
     }
+    refresh_pac();
     if new_state {
         test_single_host(target);
     }
@@ -416,9 +410,8 @@ pub fn remove_custom_domain(domain: &str) -> bool {
             true
         });
     }
-    if ENABLED.load(Ordering::SeqCst) {
-        set_pac(true);
-    }
+    disconnect_disallowed_sessions();
+    refresh_pac();
     notify_ui();
     true
 }
@@ -512,17 +505,17 @@ fn winhttp_session() -> Option<*mut core::ffi::c_void> {
     }
 }
 
-static CUSTOM_URL: Mutex<String> = Mutex::new(String::new());
+static DOH_SETTINGS: Mutex<(DohProvider, String)> = Mutex::new((DohProvider::Cloudflare, String::new()));
 
 pub fn custom_url() -> String {
-    CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
 }
 
 pub fn save_custom_url(url: &str) -> bool {
     if parse_endpoint(url).is_none() || !crate::config::save_doh_url(url) {
         return false;
     }
-    *CUSTOM_URL.lock().unwrap_or_else(|e| e.into_inner()) = url.to_owned();
+    DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner()).1 = url.to_owned();
     true
 }
 
@@ -761,8 +754,11 @@ pub fn resolve_doh_all(host: &str) -> Vec<IpAddr> {
     {
         return Vec::new();
     }
-    let provider = doh_provider();
-    let url = if provider == DohProvider::Custom { custom_url() } else { String::new() };
+    let (provider, url) = {
+        let settings = DOH_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = if settings.0 == DohProvider::Custom { settings.1.clone() } else { String::new() };
+        (settings.0, url)
+    };
     let cache_key = (provider.index(), url.clone(), host.to_owned());
     if let Some(map) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if let Some((ips, t)) = map.get(&cache_key) {
@@ -935,29 +931,40 @@ fn obj_get_string<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
 }
 
 // ---------------- PAC & Windows Registry ----------------
-pub(crate) fn build_pac(enabled: bool, direct_cdn: bool, extra_domains: &[CustomDomain]) -> String {
-    if !enabled {
-        return "function FindProxyForURL(url,host){return \"DIRECT\";}".to_string();
-    }
-    let conds: Vec<String> = DOMAINS
+fn routing_rules(direct_cdn: bool, custom: &[CustomDomain]) -> Vec<(&str, bool)> {
+    let mut rules: Vec<_> = DOMAINS
         .iter()
-        .copied()
-        .filter(|d| !direct_cdn || !CDN_DOMAINS.contains(d))
-        .chain(
-            extra_domains
-                .iter()
-                .filter(|c| c.enabled)
-                .map(|c| c.domain.as_str()),
-        )
-        .map(|d| format!("dnsDomainIs(host,\".{d}\")||host==\"{d}\""))
+        .map(|&domain| (domain, !(direct_cdn && CDN_DOMAINS.contains(&domain))))
         .collect();
-    if conds.is_empty() {
-        return "function FindProxyForURL(url,host){return \"DIRECT\";}".to_string();
+    let custom_start = rules.len();
+    rules.extend(custom.iter().map(|item| (item.domain.as_str(), item.enabled)));
+    // A specific custom entry overrides a broader custom suffix.
+    rules[custom_start..].sort_by_key(|(domain, _)| std::cmp::Reverse(domain.len()));
+    rules
+}
+
+fn routes_through_proxy(host: &str, rules: &[(&str, bool)]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    rules
+        .iter()
+        .find(|(domain, _)| domain_matches(&host, domain))
+        .is_some_and(|(_, enabled)| *enabled)
+}
+
+pub(crate) fn build_pac(enabled: bool, direct_cdn: bool, extra_domains: &[CustomDomain]) -> String {
+    let mut script = "function FindProxyForURL(url,host){".to_string();
+    if enabled {
+        script.push_str("host=host.toLowerCase().replace(/\\.+$/, '');");
+        let proxy = format!("PROXY 127.0.0.1:{PORT}");
+        for (domain, enabled) in routing_rules(direct_cdn, extra_domains) {
+            let route = if enabled { &proxy } else { "DIRECT" };
+            script.push_str(&format!(
+                r#"if(dnsDomainIs(host,".{domain}")||host=="{domain}")return "{route}";"#
+            ));
+        }
     }
-    format!(
-        "function FindProxyForURL(url,host){{if({}){{return \"PROXY 127.0.0.1:{PORT}\";}}return \"DIRECT\";}}",
-        conds.join("||")
-    )
+    script.push_str("return \"DIRECT\";}");
+    script
 }
 
 fn pac(enabled: bool) -> String {
@@ -966,68 +973,48 @@ fn pac(enabled: bool) -> String {
     build_pac(enabled, direct_cdn, &extra)
 }
 
-pub fn set_pac(enable: bool) {
-    let key_w = wide(IE_KEY);
-    let name_w = wide("AutoConfigURL");
-    unsafe {
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let rc = RegCreateKeyW(HKEY_CURRENT_USER, key_w.as_ptr(), &mut hkey);
-        if rc == 0 && !hkey.is_null() {
-            if enable {
-                let ver = PAC_VERSION.fetch_add(1, Ordering::SeqCst);
-                let url = format!("http://127.0.0.1:{PORT}/proxy.pac?v={ver}");
-                let val_w = wide(&url);
-                RegSetValueExW(
-                    hkey,
-                    name_w.as_ptr(),
-                    0,
-                    REG_SZ,
-                    val_w.as_ptr() as *const u8,
-                    (val_w.len() * 2) as u32,
-                );
-            } else {
-                RegDeleteValueW(hkey, name_w.as_ptr());
-            }
-            RegCloseKey(hkey);
-        }
-        InternetSetOptionW(std::ptr::null(), INTERNET_OPTION_SETTINGS_CHANGED, std::ptr::null(), 0);
-        InternetSetOptionW(std::ptr::null(), INTERNET_OPTION_REFRESH, std::ptr::null(), 0);
+fn refresh_pac() {
+    let _update = PAC_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+    if ENABLED.load(Ordering::SeqCst) && pac::WINDOWS.refresh() {
+        pac::notify_windows();
     }
 }
 
-/// Full Windows proxy cleanup: remove AutoConfigURL, force ProxyEnable=0, flush WinInet, clear DNS cache.
-pub fn reset_network_proxy() {
-    ENABLED.store(false, Ordering::SeqCst);
+pub fn recover_network_proxy() -> Result<pac::Recovery, ()> {
+    let _update = PAC_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+    restore_pac()
+}
+
+fn restore_pac() -> Result<pac::Recovery, ()> {
+    let restored = pac::WINDOWS.restore()?;
+    if restored == pac::Recovery::Restored {
+        pac::notify_windows();
+    }
+    Ok(restored)
+}
+
+pub fn reset_network_proxy() -> bool {
     clear_dns_cache();
-    let key_w = wide(IE_KEY);
-    let pac_name_w = wide("AutoConfigURL");
-    let enable_name_w = wide("ProxyEnable");
-    unsafe {
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let rc = RegCreateKeyW(HKEY_CURRENT_USER, key_w.as_ptr(), &mut hkey);
-        if rc == 0 && !hkey.is_null() {
-            RegDeleteValueW(hkey, pac_name_w.as_ptr());
-            let zero: u32 = 0;
-            RegSetValueExW(
-                hkey,
-                enable_name_w.as_ptr(),
-                0,
-                REG_DWORD,
-                (&zero as *const u32).cast(),
-                4,
-            );
-            RegCloseKey(hkey);
-        }
-        InternetSetOptionW(std::ptr::null(), INTERNET_OPTION_SETTINGS_CHANGED, std::ptr::null(), 0);
-        InternetSetOptionW(std::ptr::null(), INTERNET_OPTION_REFRESH, std::ptr::null(), 0);
-    }
-    notify_ui();
+    set_enabled(false)
 }
 
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::SeqCst);
-    set_pac(on);
+pub fn set_enabled(on: bool) -> bool {
+    let _update = PAC_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+    let success = if on {
+        ENABLED.store(true, Ordering::SeqCst);
+        let installed = pac::WINDOWS.install();
+        ENABLED.store(installed, Ordering::SeqCst);
+        if installed {
+            pac::notify_windows();
+        }
+        installed
+    } else {
+        ENABLED.store(false, Ordering::SeqCst);
+        disconnect_disallowed_sessions();
+        restore_pac().is_ok()
+    };
     notify_ui();
+    success
 }
 
 /// Background 0%-CPU listener for Windows IP/Wi-Fi changes via `NotifyAddrChange`.
@@ -1045,7 +1032,7 @@ pub fn start_network_watcher() {
             thread::sleep(Duration::from_secs(2));
             clear_dns_cache();
             if ENABLED.load(Ordering::SeqCst) {
-                set_pac(true);
+                refresh_pac();
                 run_test();
             }
             let h = UI_HWND.load(Ordering::SeqCst);
@@ -1066,7 +1053,7 @@ pub fn on_system_resume() {
             thread::sleep(Duration::from_millis(2500));
             clear_dns_cache();
             if ENABLED.load(Ordering::SeqCst) {
-                set_pac(true);
+                refresh_pac();
                 run_test();
             }
             let h = UI_HWND.load(Ordering::SeqCst);
@@ -1079,6 +1066,88 @@ pub fn on_system_resume() {
 }
 
 // ---------------- Local Proxy Server ----------------
+struct ProxySession {
+    host: String,
+    client: TcpStream,
+    upstream: TcpStream,
+}
+
+struct SessionGuard(usize);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        ACTIVE_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+fn current_route_allowed(host: &str) -> bool {
+    let custom = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+    ENABLED.load(Ordering::SeqCst)
+        && routes_through_proxy(host, &routing_rules(DIRECT_CDN.load(Ordering::SeqCst), &custom))
+}
+
+fn register_session(host: &str, client: &TcpStream, upstream: &TcpStream) -> Option<SessionGuard> {
+    // Serialize registration against closing sessions after a policy change.
+    let mut sessions = ACTIVE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if !current_route_allowed(host) {
+        return None;
+    }
+    let client = client.try_clone().ok()?;
+    let upstream = upstream.try_clone().ok()?;
+    let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    sessions.insert(
+        id,
+        ProxySession {
+            host: host.to_owned(),
+            client,
+            upstream,
+        },
+    );
+    Some(SessionGuard(id))
+}
+
+fn close_disallowed_sessions(
+    sessions: &mut BTreeMap<usize, ProxySession>,
+    enabled: bool,
+    rules: &[(&str, bool)],
+) {
+    sessions.retain(|_, session| {
+        if enabled && routes_through_proxy(&session.host, rules) {
+            return true;
+        }
+        let _ = session.client.shutdown(Shutdown::Both);
+        let _ = session.upstream.shutdown(Shutdown::Both);
+        false
+    });
+}
+
+fn disconnect_disallowed_sessions() {
+    let mut sessions = ACTIVE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let custom = CUSTOM_DOMAINS.lock().unwrap_or_else(|e| e.into_inner());
+    let rules = routing_rules(DIRECT_CDN.load(Ordering::SeqCst), &custom);
+    close_disallowed_sessions(&mut sessions, ENABLED.load(Ordering::SeqCst), &rules);
+}
+
+fn open_proxy_session(
+    client: &mut TcpStream,
+    host: &str,
+    port: u16,
+) -> Option<(TcpStream, SessionGuard)> {
+    if !current_route_allowed(host) {
+        let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return None;
+    }
+    let Some(upstream) = connect_upstream(host, port) else {
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return None;
+    };
+    let session = register_session(host, client, &upstream)?;
+    Some((upstream, session))
+}
+
 pub fn start_proxy() -> bool {
     let Ok(listener) = TcpListener::bind(("127.0.0.1", PORT)) else {
         return false;
@@ -1187,10 +1256,7 @@ fn handle(mut c: TcpStream) -> Option<()> {
         let (raw_host, port) = target.rsplit_once(':')?;
         let host = raw_host.trim_matches(|ch| ch == '[' || ch == ']');
         let port: u16 = port.parse().ok()?;
-        let Some(mut up) = connect_upstream(host, port) else {
-            let _ = c.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            return None;
-        };
+        let (mut up, _session) = open_proxy_session(&mut c, host, port)?;
         c.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .ok()?;
 
@@ -1227,7 +1293,7 @@ fn handle(mut c: TcpStream) -> Option<()> {
             None => (hostport, 80),
         };
         let host = raw_host.trim_matches(|ch| ch == '[' || ch == ']');
-        let mut up = connect_upstream(host, port)?;
+        let (mut up, _session) = open_proxy_session(&mut c, host, port)?;
         let mut req_bytes = Vec::with_capacity(n);
         if let Some(crlf) = buf[..n].windows(2).position(|w| w == b"\r\n") {
             let new_req_line = format!("{method} {path} {version}");
@@ -1414,25 +1480,75 @@ mod tests {
 
     #[test]
     fn pac_respects_direct_cdn_and_custom_enabled() {
-        let extra = vec![
-            CustomDomain { domain: "reddit.com".into(), enabled: true },
-            CustomDomain { domain: "bbc.com".into(), enabled: false },
+        let extra = [
+            CustomDomain { domain: "example.test".into(), enabled: true },
+            CustomDomain { domain: "news.example.test".into(), enabled: false },
         ];
         let full = build_pac(true, false, &extra);
         assert!(full.contains(r#"dnsDomainIs(host,".steampowered.com")"#));
-        assert!(full.contains(r#"dnsDomainIs(host,".steamcontent.com")"#));
-        assert!(full.contains(r#"dnsDomainIs(host,".akamaihd.net")"#));
-        assert!(full.contains(r#"dnsDomainIs(host,".reddit.com")||host=="reddit.com""#));
-        assert!(!full.contains("bbc.com"));
+        let proxy_rule = |domain: &str| format!(r#"host=="{domain}")return "PROXY 127.0.0.1:{PORT}";"#);
+        let direct_rule = |domain: &str| format!(r#"host=="{domain}")return "DIRECT";"#);
+        assert!(full.contains(&proxy_rule("steamcontent.com")));
+        assert!(full.contains(&proxy_rule("akamaihd.net")));
+        let specific = full.find(&direct_rule("news.example.test")).unwrap();
+        let broad = full.find(&proxy_rule("example.test")).unwrap();
+        assert!(specific < broad);
 
         let direct = build_pac(true, true, &extra);
-        assert!(direct.contains(r#"dnsDomainIs(host,".steampowered.com")"#));
-        assert!(!direct.contains("steamcontent.com"));
-        assert!(!direct.contains("akamaihd.net"));
-        assert!(direct.contains("reddit.com"));
+        assert!(direct.contains(&proxy_rule("steampowered.com")));
+        assert!(direct.contains(&direct_rule("steamcontent.com")));
+        assert!(direct.contains(&direct_rule("akamaihd.net")));
+        assert!(direct.contains(&proxy_rule("example.test")));
 
         let off = build_pac(false, false, &extra);
         assert_eq!(off, r#"function FindProxyForURL(url,host){return "DIRECT";}"#);
+
+        let rules = routing_rules(true, &extra);
+        assert!(routes_through_proxy("www.example.test", &rules));
+        assert!(!routes_through_proxy("WWW.NEWS.EXAMPLE.TEST.", &rules));
+        assert!(!routes_through_proxy("example.invalid", &rules));
+        assert!(!routes_through_proxy("notexample.test", &rules));
+        assert!(!routes_through_proxy("cdn.steamcontent.com", &rules));
+        assert!(routes_through_proxy("store.steampowered.com", &rules));
+    }
+
+    #[test]
+    fn turning_off_a_domain_closes_only_its_sessions() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket_pair = || {
+            let peer = TcpStream::connect(addr).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            (listener.accept().unwrap().0, peer)
+        };
+        let make_session = |host: &str| {
+            let (client, client_peer) = socket_pair();
+            let (upstream, upstream_peer) = socket_pair();
+            (
+                ProxySession { host: host.into(), client, upstream },
+                client_peer,
+                upstream_peer,
+            )
+        };
+        let (disabled, mut disabled_client, mut disabled_upstream) = make_session("www.news.example.test");
+        let (allowed, mut allowed_client, mut allowed_upstream) = make_session("www.example.test");
+        // The relay keeps its own handles after a session is removed from the registry.
+        let _relay_sockets = (disabled.client.try_clone().unwrap(), disabled.upstream.try_clone().unwrap());
+        let mut sessions = BTreeMap::from([(1, disabled), (2, allowed)]);
+        let rules = [("news.example.test", false), ("example.test", true)];
+        close_disallowed_sessions(&mut sessions, true, &rules);
+
+        let mut byte = [0];
+        assert_eq!(disabled_client.read(&mut byte).unwrap(), 0);
+        assert_eq!(disabled_upstream.read(&mut byte).unwrap(), 0);
+        let allowed = sessions.get_mut(&2).unwrap();
+        allowed.client.write_all(b"a").unwrap();
+        allowed.upstream.write_all(b"b").unwrap();
+        allowed_client.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"a");
+        allowed_upstream.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"b");
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]
@@ -1473,7 +1589,7 @@ mod tests {
         assert_eq!(DohProvider::from_id("dnssb"), DohProvider::Custom);
         assert_eq!(DohProvider::from_id("unknown"), DohProvider::Cloudflare);
         for (i, p) in DohProvider::ALL.iter().enumerate() {
-            assert_eq!(DohProvider::from_index(i), *p);
+            assert_eq!(p.index(), i);
             assert_eq!(p.endpoints().is_empty(), *p == DohProvider::Custom);
         }
     }
