@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
-# Monochrome Windows icon with an outlined tile and a white bypass arrow.
+# Monochrome Windows icon with a dark tile and a white bypass arrow.
 function RoundRect($x, $y, $w, $h, $r) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
     $p.AddArc($x, $y, $r, $r, 180, 90)
@@ -16,11 +16,9 @@ function Draw([int]$s) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
     $k = $s / 256.0
-    $bg = RoundRect (14 * $k) (14 * $k) (228 * $k) (228 * $k) (92 * $k)
+    $bg = RoundRect (7 * $k) (7 * $k) (242 * $k) (242 * $k) (106 * $k)
     $tile = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 16, 16, 16))
-    $outline = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 221, 221, 221)), (14 * $k)
     $g.FillPath($tile, $bg)
-    $g.DrawPath($outline, $bg)
 
     $white = [System.Drawing.Color]::White
     # barrier
@@ -38,7 +36,6 @@ function Draw([int]$s) {
     $g.DrawLine($pen, (214 * $k), (158 * $k), (192 * $k), (180 * $k))
     $pen.Dispose()
     $bar.Dispose()
-    $outline.Dispose()
     $tile.Dispose()
     $bg.Dispose()
     $g.Dispose()

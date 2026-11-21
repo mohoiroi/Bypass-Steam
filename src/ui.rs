@@ -590,20 +590,20 @@ fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: boo
     state.max_scroll = 0.0;
     let fonts = &state.fonts;
     let rows = [
-        ("Đi thẳng CDN tải game", "Tận dụng cache nội mạng.", ID_MENU_DIRECT_CDN),
-        ("Khởi chạy cùng Windows", "Mở ứng dụng trong khay khi đăng nhập.", ID_MENU_AUTOSTART),
-        ("Giao diện", "", 0),
-        ("Cập nhật", DISPLAY_VERSION, ID_UPDATE),
+        ("Đi thẳng CDN tải game", "Tận dụng cache nội mạng.", ID_MENU_DIRECT_CDN, Some(direct)),
+        ("Khởi chạy cùng Windows", "Mở ứng dụng trong khay khi đăng nhập.", ID_MENU_AUTOSTART, Some(state.autostart)),
+        ("Chế độ tối", "", ID_DARK_MODE, Some(!is_light())),
+        ("Cập nhật", DISPLAY_VERSION, ID_UPDATE, None),
     ];
 
     let panel = RectF::new(card.x, card.y, card.w, rows.len() as f32 * UTILITY_ROW_H + 10.0);
     c.fill_round_rect(panel, R_PANEL, theme::surface_inset());
     c.stroke_round_rect(panel, R_PANEL, 1.0, theme::border_sub());
 
-    for (index, (title, description, command)) in rows.into_iter().enumerate() {
+    for (index, (title, description, command, switch)) in rows.into_iter().enumerate() {
         let row = RectF::new(panel.x + 10.0, panel.y + 5.0 + index as f32 * UTILITY_ROW_H, panel.w - 20.0, UTILITY_ROW_H);
         let action = Action::Utility(command);
-        let is_switch = index < 2;
+        let is_switch = switch.is_some();
         let hovered = state.hover == Some(action);
         if is_switch && hovered {
             c.fill_round_rect(row.inset(0.0, 2.0), R_SM, theme::surface_hover());
@@ -616,27 +616,17 @@ fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: boo
         c.draw_text(title, RectF::new(row.x + 4.0, title_y, caption_w, 19.0), fonts.group, theme::text(), DT_LEFT);
         c.draw_text(description, RectF::new(row.x + 4.0, row.y + 24.0, caption_w, 17.0), fonts.caption, theme::text_muted(), DT_LEFT);
 
-        let controls_x = row.right() - 126.0;
-        if is_switch {
-            let on = if index == 0 { direct } else { state.autostart };
+        if let Some(on) = switch {
             c.draw_text(if on { "Bật" } else { "Tắt" }, RectF::new(row.right() - 92.0, row.y, 35.0, row.h),
                 fonts.caption, theme::text_sec(), DT_RIGHT);
             draw_mini_toggle(c, RectF::new(row.right() - 47.0, row.cy() - 10.0, 35.0, 20.0), on, hovered);
             state.hits.push((row, action));
-        } else if command == ID_UPDATE {
+        } else {
             let busy = state.update.is_some();
-            let button = RectF::new(controls_x, row.cy() - 15.0, 116.0, 30.0);
+            let button = RectF::new(row.right() - 126.0, row.cy() - 15.0, 116.0, 30.0);
             paint_button(c, fonts, button, if busy { "Đang kiểm tra…" } else { "Kiểm tra cập nhật" },
                 false, hovered && !busy);
             if !busy { state.hits.push((button, action)); }
-        } else {
-            let light = is_light();
-            for (offset, label, cmd, active) in [(0.0, "Sáng", ID_LIGHT, light), (58.0, "Tối", ID_DARK, !light)] {
-                let button = RectF::new(controls_x + offset, row.cy() - 15.0, 56.0, 30.0);
-                let action = Action::Utility(cmd);
-                paint_button(c, fonts, button, label, active, state.hover == Some(action));
-                state.hits.push((button, action));
-            }
         }
     }
 }
@@ -1862,8 +1852,7 @@ fn apply_dwm(hwnd: HWND) {
     }
 }
 
-const ID_LIGHT: usize = 8;
-const ID_DARK: usize = 9;
+const ID_DARK_MODE: usize = 8;
 const ID_UPDATE: usize = 10;
 const WM_UPDATE_DONE: u32 = WM_APP + 6;
 
@@ -1878,8 +1867,7 @@ fn utilities_menu(hwnd: HWND) -> HMENU {
             wide("Đi thẳng CDN tải game").as_ptr());
         AppendMenuW(menu, MF_STRING | checked(auto), ID_MENU_AUTOSTART, wide("Khởi chạy cùng Windows").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_STRING | checked(is_light()), ID_LIGHT, wide("Giao diện sáng").as_ptr());
-        AppendMenuW(menu, MF_STRING | checked(!is_light()), ID_DARK, wide("Giao diện tối").as_ptr());
+        AppendMenuW(menu, MF_STRING | checked(!is_light()), ID_DARK_MODE, wide("Chế độ tối").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         let label = if busy { "Đang kiểm tra cập nhật…" } else { "Kiểm tra cập nhật…" };
         AppendMenuW(menu, if busy { MF_GRAYED } else { MF_STRING }, ID_UPDATE, wide(label).as_ptr());
@@ -1895,9 +1883,8 @@ fn utility_command(hwnd: HWND, command: usize) {
     match command {
         ID_MENU_AUTOSTART => toggle_autostart_ui(hwnd),
         ID_MENU_DIRECT_CDN => toggle_direct_cdn_ui(hwnd),
-        ID_LIGHT | ID_DARK => unsafe {
-            let light = command == ID_LIGHT;
-            if light == is_light() { return; }
+        ID_DARK_MODE => unsafe {
+            let light = !is_light();
             if !config::save_light_theme(light) {
                 MessageBoxW(hwnd, wide("Không thể lưu giao diện.").as_ptr(), wide("Tiện ích").as_ptr(), MB_OK);
                 return;
@@ -2112,7 +2099,7 @@ fn show_tray_menu(hwnd: HWND) {
             ID_MENU_OPEN => show_main(hwnd),
             ID_MENU_TOGGLE => activate_action(hwnd, Action::ToggleBypass),
             ID_MENU_TEST => activate_action(hwnd, Action::RunTest),
-            ID_MENU_DIRECT_CDN | ID_MENU_AUTOSTART | ID_LIGHT | ID_DARK | ID_UPDATE => utility_command(hwnd, cmd_id),
+            ID_MENU_DIRECT_CDN | ID_MENU_AUTOSTART | ID_DARK_MODE | ID_UPDATE => utility_command(hwnd, cmd_id),
             ID_MENU_RESET_NET => reset_network_ui(hwnd),
             ID_MENU_EXIT => {
                 DestroyWindow(hwnd);
@@ -2824,6 +2811,13 @@ mod tests {
             assert!(provider_button.bottom() < sidebar.bottom());
             assert_eq!(has_action(Action::RunTest), on);
             assert_eq!(has_action(Action::FocusInput), tab == Tab::Custom);
+            if tab == Tab::Utilities {
+                let dark_mode = Action::Utility(ID_DARK_MODE);
+                let mut switches = state.hits.iter().filter(|(_, action)| *action == dark_mode);
+                let (bounds, _) = switches.next().expect("dark mode switch");
+                assert!(switches.next().is_none());
+                assert!(hit_test(&state, bounds.right() - 29.5, bounds.cy()) == Some(dark_mode));
+            }
             if tab == Tab::Steam && expand_group.is_none() && size == (WIN_W, WIN_H) {
                 assert_eq!(state.max_scroll, 0.0, "collapsed groups fit the default window");
             }

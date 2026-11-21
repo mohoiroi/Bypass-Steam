@@ -9,7 +9,7 @@ mod ui;
 mod update;
 
 // Product version shown in the desktop interface.
-pub(crate) const DISPLAY_VERSION: &str = "v1.1";
+pub(crate) const DISPLAY_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 use std::ptr::null;
 use windows_sys::Win32::UI::{

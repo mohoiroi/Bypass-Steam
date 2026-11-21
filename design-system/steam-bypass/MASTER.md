@@ -19,9 +19,9 @@ The 832 × 468 DIP window opens with Steam selected. The connection panel is 210
 
 The DoH menu aligns provider names and addresses in separate columns, with a checkmark on the selected provider. Custom DoH opens a compact 234 × 94 dialog-unit form. Feedback sits below the URL field. The footer actions are Hủy, Thử kết nối and Lưu và áp dụng in that order.
 
-The right pane has tabs for Steam, Web khác and Tiện ích. Steam uses 48 DIP service rows with a separate line for descriptions. Expand a group to see per-host details. Web khác contains domain management. Tiện ích holds the CDN, startup, theme and update controls. The shared pane footer places Thoát at the lower right on every tab. The window supports both columns down to 716 × 440 DIP.
+The right pane has tabs for Steam, Web khác and Tiện ích. Steam uses 48 DIP service rows with a separate line for descriptions. Expand a group to see per-host details. Web khác contains domain management. Tiện ích uses switches for CDN, startup and dark mode, with a separate button for checking updates. The shared pane footer places Thoát at the lower right on every tab. The window supports both columns down to 716 × 440 DIP.
 
-The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The Windows app icon uses a white bypass arrow on a black tile with a light outline. The runtime theme file owns the desktop colors and sizes.
+The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The Windows app icon uses a white bypass arrow on a solid black tile. The runtime theme file owns the desktop colors and sizes.
 
 
 ## Original web design reference
