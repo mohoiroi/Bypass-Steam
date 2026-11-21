@@ -486,7 +486,7 @@ fn record(
 // ---------------- WinHTTP DoH ----------------
 fn winhttp_session() -> Option<*mut core::ffi::c_void> {
     let ptr = *WINHTTP_SESSION.get_or_init(|| unsafe {
-        let agent = wide("SteamBypass/1.0");
+        let agent = wide(concat!("SteamBypass/", env!("CARGO_PKG_VERSION")));
         let h = WinHttpOpen(
             agent.as_ptr(),
             WINHTTP_ACCESS_TYPE_NO_PROXY,

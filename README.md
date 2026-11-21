@@ -16,12 +16,12 @@
   - *(Lưu ý: chỉ vượt chặn DNS/DPI nhà mạng; trang tự chặn IP quốc gia/WAF lỗi `403` cần VPN.)*
 - **Tiện ích:** Chọn giao diện sáng/tối, kiểm tra cập nhật và bật khởi chạy cùng Windows. Khi bật khởi chạy, ứng dụng tự động chạy ẩn dưới khay hệ thống (`--minimized`) khi mở máy.
 - **Tự phục hồi kết nối:** Tự xóa cache DNS và kiểm tra lại khi máy thức dậy sau Sleep hoặc khi đổi Wi-Fi/LAN; kèm nút **Khôi phục mạng (Gỡ proxy)** ngay trong menu khay hệ thống.
-- **Giao diện tối giản khoa học (Native Win32/GDI+):** Bố cục Bento bất đối xứng rõ ràng, file `.exe` duy nhất (~416 KB), không cần cài thư viện ngoài hay quyền Admin.
+- **Điều khiển nhanh (Win32/GDI+):** Cột trái có trạng thái kết nối, công tắc bật/tắt proxy, độ trễ, số máy chủ phản hồi và bộ chọn DoH. Chuyển giữa Steam, Web khác và Tiện ích ở cột phải.
 
 ## Cách sử dụng
 1. Chạy `steam_bypass.exe` (không cần quyền Admin).
 2. Khi các nhóm dịch vụ chuyển xanh **Đã bypass**, mở hoặc tải lại Steam (Store, Community, tải game...).
-3. Bấm **Thoát** ở góc dưới hoặc chuột phải vào icon ở khay hệ thống → **Thoát** để dừng và tự gỡ proxy.
+3. Bấm **Thoát** ở góc dưới bên phải hoặc chọn **Thoát** từ menu khay hệ thống để dừng ứng dụng và gỡ proxy.
 4. Nếu máy tắt đột ngột và mạng bị kẹt proxy, chạy lệnh:
    ```powershell
    steam_bypass.exe off

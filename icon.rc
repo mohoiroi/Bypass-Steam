@@ -1,16 +1,40 @@
+#include "steam_bypass_version.h"
+
 1 ICON "icon.ico"
 
-201 DIALOGEX 0, 0, 294, 132
-STYLE 0x80C808C0
+1 VERSIONINFO
+FILEVERSION APP_VERSION
+PRODUCTVERSION APP_VERSION
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Steam Bypass"
+            VALUE "FileVersion", APP_VERSION_STRING
+            VALUE "ProductName", "Steam Bypass"
+            VALUE "ProductVersion", APP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+201 DIALOGEX 0, 0, 234, 94
+STYLE 0x82C808C0
 EXSTYLE 0x00000001
 CAPTION "Custom DoH"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT "", 203, 12, 10, 270, 16
-    LTEXT "", 204, 12, 30, 270, 12
-    EDITTEXT 202, 12, 44, 270, 19, 0x0080
-    LTEXT "", 205, 12, 69, 270, 24
-    PUSHBUTTON "Test connection", 206, 12, 101, 100, 20, 0x000B
-    PUSHBUTTON "Cancel", 2, 156, 101, 60, 20, 0x000B
-    PUSHBUTTON "Save", 1, 222, 101, 60, 20, 0x000B
+    LTEXT "", 204, 10, 8, 214, 11
+    // WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL. The dialog paints the field outline.
+    CONTROL "", 202, "EDIT", 0x50010080, 14, 24, 206, 12
+    LTEXT "", 205, 10, 44, 214, 19
+    PUSHBUTTON "Cancel", 2, 59, 71, 38, 16, 0x000B
+    PUSHBUTTON "Test connection", 206, 103, 71, 55, 16, 0x000B
+    PUSHBUTTON "Save", 1, 164, 71, 60, 16, 0x000B
 END

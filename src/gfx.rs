@@ -1,7 +1,7 @@
 //! Leak-free RAII wrappers around Win32 GDI+ (anti-aliased shapes) and GDI ClearType text.
 
 use crate::proxy::wide;
-use crate::theme::{self, Color};
+use crate::theme::Color;
 use std::ptr::null_mut;
 use windows_sys::Win32::{
     Foundation::RECT,
@@ -88,7 +88,6 @@ impl RectF {
 pub struct FontSet {
     pub kpi: HFONT,
     pub title: HFONT,
-    pub micro: HFONT,
     pub group: HFONT,
     pub body: HFONT,
     pub caption: HFONT,
@@ -125,7 +124,6 @@ impl FontSet {
         Self {
             kpi: make_font("Consolas", 21.0 * s, FW_BOLD),
             title: make_font("Segoe UI", 16.5 * s, FW_BOLD),
-            micro: make_font("Segoe UI", 10.0 * s, FW_SEMIBOLD),
             group: make_font("Segoe UI", 13.5 * s, FW_SEMIBOLD),
             body: make_font("Segoe UI", 12.5 * s, FW_NORMAL),
             caption: make_font("Segoe UI", 11.5 * s, FW_NORMAL),
@@ -142,7 +140,6 @@ impl Drop for FontSet {
             for h in [
                 self.kpi,
                 self.title,
-                self.micro,
                 self.group,
                 self.body,
                 self.caption,
@@ -368,43 +365,6 @@ impl Canvas {
         }
     }
 
-    pub fn draw_arc(
-        &mut self,
-        cx: f32,
-        cy: f32,
-        radius: f32,
-        start_deg: f32,
-        sweep_deg: f32,
-        width: f32,
-        color: Color,
-    ) {
-        let gp = self.ensure_gp();
-        if gp.is_null() {
-            return;
-        }
-        let s = self.scale;
-        let d = radius * 2.0 * s;
-        unsafe {
-            let mut pen: *mut GpPen = null_mut();
-            GdipCreatePen1(color.argb(), width * s, UnitPixel, &mut pen);
-            if !pen.is_null() {
-                GdipSetPenStartCap(pen, LineCapRound);
-                GdipSetPenEndCap(pen, LineCapRound);
-                GdipDrawArc(
-                    gp,
-                    pen,
-                    (cx - radius) * s,
-                    (cy - radius) * s,
-                    d,
-                    d,
-                    start_deg,
-                    sweep_deg,
-                );
-                GdipDeletePen(pen);
-            }
-        }
-    }
-
     pub fn draw_chevron(&mut self, cx: f32, cy: f32, r: f32, expanded: bool, color: Color) {
         let gp = self.ensure_gp();
         if gp.is_null() {
@@ -469,24 +429,6 @@ impl Canvas {
     pub fn draw_cross(&mut self, cx: f32, cy: f32, r: f32, width: f32, color: Color) {
         self.draw_line(cx - r, cy - r, cx + r, cy + r, width, color, true);
         self.draw_line(cx + r, cy - r, cx - r, cy + r, width, color, true);
-    }
-
-    pub fn draw_logo(&mut self, x: f32, y: f32, size: f32) {
-        let rect = RectF::new(x, y, size, size);
-        self.fill_round_rect(rect, size * 0.2, theme::surface());
-        self.stroke_round_rect(rect, size * 0.2, 1.0, theme::border());
-
-        let scale = size / 24.0;
-        let px = |dx: f32| x + dx * scale;
-        let py = |dy: f32| y + dy * scale;
-        let stroke = 1.7 * scale;
-        let ink = theme::text();
-        self.draw_arc(px(12.0), py(13.0), 5.8 * scale, 180.0, 180.0, stroke, ink);
-        self.draw_line(px(6.2), py(13.0), px(6.2), py(17.0), stroke, ink, true);
-        self.draw_line(px(17.8), py(13.0), px(17.8), py(17.0), stroke, ink, true);
-        self.draw_line(px(15.6), py(15.0), px(17.8), py(17.0), stroke, ink, true);
-        self.draw_line(px(20.0), py(15.0), px(17.8), py(17.0), stroke, ink, true);
-        self.draw_line(px(12.0), py(14.0), px(12.0), py(18.0), stroke, theme::text_dim(), true);
     }
 
     pub fn measure_text(&mut self, text: &str, font: HFONT) -> (f32, f32) {

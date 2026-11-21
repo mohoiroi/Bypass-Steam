@@ -1,5 +1,6 @@
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
-# Minimal logo: blue squircle + white arc "jumping over" a short barrier bar.
+# Monochrome Windows icon with an outlined tile and a white bypass arrow.
 function RoundRect($x, $y, $w, $h, $r) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
     $p.AddArc($x, $y, $r, $r, 180, 90)
@@ -15,8 +16,11 @@ function Draw([int]$s) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
     $k = $s / 256.0
-    $bg = RoundRect (8 * $k) (8 * $k) (240 * $k) (240 * $k) (96 * $k)
-    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 59, 130, 246))), $bg)
+    $bg = RoundRect (14 * $k) (14 * $k) (228 * $k) (228 * $k) (92 * $k)
+    $tile = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 16, 16, 16))
+    $outline = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 221, 221, 221)), (14 * $k)
+    $g.FillPath($tile, $bg)
+    $g.DrawPath($outline, $bg)
 
     $white = [System.Drawing.Color]::White
     # barrier
@@ -32,11 +36,18 @@ function Draw([int]$s) {
     $g.DrawLine($pen, (192 * $k), (136 * $k), (192 * $k), (178 * $k))
     $g.DrawLine($pen, (170 * $k), (158 * $k), (192 * $k), (180 * $k))
     $g.DrawLine($pen, (214 * $k), (158 * $k), (192 * $k), (180 * $k))
+    $pen.Dispose()
+    $bar.Dispose()
+    $outline.Dispose()
+    $tile.Dispose()
+    $bg.Dispose()
     $g.Dispose()
     $ms = New-Object System.IO.MemoryStream
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
-    return ,$ms.ToArray()
+    $png = $ms.ToArray()
+    $ms.Dispose()
+    return ,$png
 }
 $sizes = 16, 24, 32, 48, 256
 $imgs = $sizes | ForEach-Object { , (Draw $_) }

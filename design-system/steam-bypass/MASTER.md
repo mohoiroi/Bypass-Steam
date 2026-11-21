@@ -15,9 +15,13 @@
 
 ## Windows desktop
 
-The window uses one full-width workspace. The header holds the app version and proxy action. A compact three-column status panel shows proxy state, average latency and host health. Horizontal tabs switch between Steam, Web khác and Tiện ích. The toolbar includes a native DoH menu with grayscale item backgrounds and a checked provider. The Steam view aligns latency, response counts and state in table columns. State labels use neutral backgrounds and colored text.
+The 832 × 468 DIP window opens with Steam selected. The connection panel is 210–228 DIP wide and aligns with the workspace at the top and bottom. The clickable proxy control stacks the status, address and switch on the panel's centerline. A divider separates the two centered metrics below the control. A small unit label follows the latency value. The DoH selector, connection check and feedback form a section at the bottom. The connected status dot uses green.
 
-The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The runtime theme file owns the desktop colors and sizes.
+The DoH menu aligns provider names and addresses in separate columns, with a checkmark on the selected provider. Custom DoH opens a compact 234 × 94 dialog-unit form. Feedback sits below the URL field. The footer actions are Hủy, Thử kết nối and Lưu và áp dụng in that order.
+
+The right pane has tabs for Steam, Web khác and Tiện ích. Steam uses 48 DIP service rows with a separate line for descriptions. Expand a group to see per-host details. Web khác contains domain management. Tiện ích holds the CDN, startup, theme and update controls. The shared pane footer places Thoát at the lower right on every tab. The window supports both columns down to 716 × 440 DIP.
+
+The main canvas is pure black in dark mode and pure white in light mode. Panels, buttons, separators and hover states use grayscale. Green text marks healthy connections, red marks errors, and blue marks selections or information. Use Segoe UI for navigation and labels and Consolas for metrics. The Windows app icon uses a white bypass arrow on a black tile with a light outline. The runtime theme file owns the desktop colors and sizes.
 
 
 ## Original web design reference
