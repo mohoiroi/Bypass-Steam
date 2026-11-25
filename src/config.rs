@@ -32,11 +32,20 @@ fn read_reg_sz(subkey: &str, value_name: &str) -> Option<String> {
 }
 
 pub(crate) fn read_reg_string(subkey: &str, value_name: &str) -> Result<Option<(u32, String)>, ()> {
+    read_registry_string(HKEY_CURRENT_USER, subkey, value_name, 0)
+}
+
+pub(crate) fn read_registry_string(
+    root: HKEY,
+    subkey: &str,
+    value_name: &str,
+    view: REG_SAM_FLAGS,
+) -> Result<Option<(u32, String)>, ()> {
     let key_w = wide(subkey);
     let name_w = wide(value_name);
     unsafe {
         let mut hkey: HKEY = null_mut();
-        let rc = RegOpenKeyExW(HKEY_CURRENT_USER, key_w.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey);
+        let rc = RegOpenKeyExW(root, key_w.as_ptr(), 0, KEY_QUERY_VALUE | view, &mut hkey);
         if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
             return Ok(None);
         }

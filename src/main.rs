@@ -5,6 +5,7 @@ mod config;
 mod gfx;
 mod pac;
 mod proxy;
+mod steam;
 mod theme;
 mod ui;
 mod update;

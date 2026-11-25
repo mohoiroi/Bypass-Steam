@@ -1,6 +1,6 @@
 //! Native Windows interface, system tray and Custom DoH dialog.
 
-use crate::{DISPLAY_VERSION, config::{self, CustomDomain}};
+use crate::{DISPLAY_VERSION, config::{self, CustomDomain}, steam};
 use crate::gfx::{Canvas, FontSet, PaintBuffer, RectF};
 use crate::proxy::{
     self, APP_TITLE, CDN_GROUP_IDX, CUSTOM_GROUP_IDX, DIRECT_CDN, DnsState, DohProvider, ENABLED,
@@ -54,7 +54,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_TRAY_ICON: u32 = 1;
 const ID_TIMER_NOTICE: usize = 2;
 const ID_TIMER_MOTION: usize = 3;
-const MOTION_DURATION: Duration = Duration::from_millis(220);
+const ID_TIMER_STEAM: usize = 4;
+const WM_STEAM_DONE: u32 = WM_APP + 8;
+const MOTION_DURATION: Duration = Duration::from_millis(190);
 const MOTION_FRAME_MS: u32 = 16;
 const ID_EDIT_DOMAIN: usize = 101;
 
@@ -77,7 +79,8 @@ const WORKSPACE_PAD: f32 = 12.0;
 const SIDEBAR_PAD: f32 = 10.0;
 const DOH_SECTION_H: f32 = 116.0;
 const FOOTER_H: f32 = 48.0;
-const PROXY_CONTROL_H: f32 = 96.0;
+const PROXY_CONTROL_H: f32 = 54.0;
+const CONNECTION_CONTROLS_H: f32 = 110.0;
 const UTILITY_ROW_H: f32 = 52.0;
 const NAV_ITEMS: [(Tab, &str); 3] = [
     (Tab::Steam, "Steam"),
@@ -102,6 +105,7 @@ enum Action {
     ToggleBypass,
     OpenDohMenu,
     ChooseDoh(DohProvider),
+    OpenOrRestartSteam,
     SelectTab(Tab),
     RunTest,
     FocusInput,
@@ -116,51 +120,107 @@ enum Action {
 #[derive(Default)]
 struct MotionValue {
     target: Option<f32>,
-    start: Option<(Instant, f32)>,
+    transition: Option<MotionTransition>,
+}
+
+struct MotionTransition {
+    started: Instant,
+    from: f32,
+    duration: Duration,
 }
 
 impl MotionValue {
     fn position(&self, now: Instant) -> f32 {
         let target = self.target.unwrap_or_default();
-        let Some((started, from)) = self.start else { return target };
-        let elapsed = now.saturating_duration_since(started);
-        if elapsed >= MOTION_DURATION {
+        let Some(transition) = &self.transition else { return target };
+        let elapsed = now.saturating_duration_since(transition.started);
+        if elapsed >= transition.duration {
             return target;
         }
-        let t = elapsed.as_secs_f32() / MOTION_DURATION.as_secs_f32();
-        let eased = t * t * (3.0 - 2.0 * t);
-        from + (target - from) * eased
+        let t = elapsed.as_secs_f32() / transition.duration.as_secs_f32();
+        let eased = 1.0 - (1.0 - t).powi(2);
+        transition.from + (target - transition.from) * eased
     }
 
     fn follow(&mut self, target: f32, now: Instant, animate: bool) -> f32 {
         if !animate {
-            self.start = None;
+            self.transition = None;
         } else if self.target.is_some_and(|previous| previous != target) {
             let from = self.position(now);
-            self.start = (from != target).then_some((now, from));
+            self.transition = (from != target).then(|| MotionTransition {
+                started: now,
+                from,
+                duration: MOTION_DURATION.mul_f32((from - target).abs().sqrt().clamp(0.45, 1.25)),
+            });
         }
         self.target = Some(target);
-        self.position(now)
+        self.advance(now)
     }
 
-    fn active(&self, now: Instant) -> bool {
-        self.start.is_some_and(|(started, _)| now.saturating_duration_since(started) < MOTION_DURATION)
+    fn advance(&mut self, now: Instant) -> f32 {
+        let position = self.position(now);
+        if self.transition.as_ref().is_some_and(|transition| now.saturating_duration_since(transition.started) >= transition.duration) {
+            self.transition = None;
+        }
+        position
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ToggleFrame {
+    track: RectF,
+    background: Color,
+    hovered: bool,
+}
+
+impl ToggleFrame {
+    fn bounds(self) -> RectF {
+        self.track.inset(-1.0, -1.0)
+    }
+}
+
+#[derive(Default)]
+struct ToggleMotion {
+    value: MotionValue,
+    frame: Option<ToggleFrame>,
+}
+
+impl ToggleMotion {
+    fn paint(&mut self, canvas: &mut Canvas, frame: ToggleFrame, on: bool, now: Instant, animate: bool) {
+        self.frame = Some(frame);
+        let position = self.value.follow(u8::from(on) as f32, now, animate);
+        draw_mini_toggle(canvas, frame.track, frame.hovered, position);
+    }
+
+    fn pending_frame(&self) -> Option<ToggleFrame> {
+        self.frame.filter(|_| self.value.transition.is_some())
     }
 }
 
 #[derive(Default)]
 struct UiMotion {
     tab: MotionValue,
-    proxy: MotionValue,
-    cdn: MotionValue,
-    startup: MotionValue,
-    dark_mode: MotionValue,
+    tab_bar: Option<RectF>,
+    proxy: ToggleMotion,
+    cdn: ToggleMotion,
+    startup: ToggleMotion,
+    dark_mode: ToggleMotion,
 }
 
 impl UiMotion {
-    fn active(&self, now: Instant) -> bool {
-        [&self.tab, &self.proxy, &self.cdn, &self.startup, &self.dark_mode]
-            .into_iter().any(|value| value.active(now))
+    fn switches(&mut self) -> [&mut ToggleMotion; 4] {
+        [&mut self.proxy, &mut self.cdn, &mut self.startup, &mut self.dark_mode]
+    }
+
+    fn pending_tab(&self) -> Option<RectF> {
+        self.tab_bar.filter(|_| self.tab.transition.is_some())
+    }
+
+    fn pending_regions(&self) -> impl Iterator<Item = RectF> {
+        self.pending_tab().into_iter().chain(
+            [&self.proxy, &self.cdn, &self.startup, &self.dark_mode].into_iter()
+                .filter_map(|switch| switch.pending_frame().map(ToggleFrame::bounds)),
+        )
     }
 }
 
@@ -198,6 +258,9 @@ struct UiState {
     last_tray_on: bool,
     autostart: bool,
     update: Option<std::sync::mpsc::Receiver<String>>,
+    steam_running: bool,
+    steam_action: Option<std::sync::mpsc::Receiver<Result<steam::Outcome, steam::Error>>>,
+    quit_after_steam_action: bool,
     edit_hwnd: HWND,
     edit_bg_brush: HBRUSH,
     edit_focused: bool,
@@ -206,6 +269,7 @@ struct UiState {
     animations_enabled: bool,
     frame_timer: HANDLE,
     motion_timer: MotionTimer,
+    repaint_motion_only: bool,
     motion: UiMotion,
     paint_buffer: Option<PaintBuffer>,
 }
@@ -232,6 +296,9 @@ impl UiState {
             last_tray_on: on,
             autostart,
             update: None,
+            steam_running: false,
+            steam_action: None,
+            quit_after_steam_action: false,
             edit_hwnd: null_mut(),
             edit_bg_brush,
             edit_focused: false,
@@ -243,6 +310,7 @@ impl UiState {
                     TIMER_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE)
             },
             motion_timer: MotionTimer::Idle,
+            repaint_motion_only: false,
             motion: UiMotion::default(),
             paint_buffer: None,
         }
@@ -264,9 +332,9 @@ impl UiState {
         self.motion = UiMotion::default();
     }
 
-    fn sync_motion_timer(&mut self, hwnd: HWND, frame_started: Instant) {
+    fn sync_motion_timer(&mut self, hwnd: HWND) {
         let active = self.animations_enabled
-            && self.motion.active(frame_started)
+            && self.motion.pending_regions().next().is_some()
             && unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 };
         if !active {
             self.cancel_motion_timer(hwnd);
@@ -440,6 +508,9 @@ fn paint_ui(
     let height = (phys_h as f32 / scale).max(MIN_H);
     state.hits.clear();
     state.row_targets.clear();
+    for switch in state.motion.switches() {
+        switch.frame = None;
+    }
 
     let mut c = Canvas::new(hdc, state.dpi);
     c.fill_rect(RectF::new(0.0, 0.0, width, height), theme::bg());
@@ -497,6 +568,15 @@ fn paint_workspace_footer(c: &mut Canvas, content: RectF, state: &mut UiState, p
     }
 }
 
+fn steam_button_label(running: bool, busy: bool) -> &'static str {
+    match (running, busy) {
+        (false, false) => "Mở Steam",
+        (true, false) => "Khởi động lại Steam",
+        (false, true) => "Đang mở Steam…",
+        (true, true) => "Đang khởi động lại…",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_connection_sidebar(
     c: &mut Canvas,
@@ -519,12 +599,23 @@ fn paint_connection_sidebar(
         c.draw_line(sidebar.x + 1.0, y, sidebar.right() - 1.0, y, 1.0, theme::border_sub(), false);
     }
 
-    let band_h = (doh_top - header_bottom) * 0.5;
-    let power_y = header_bottom + (band_h - PROXY_CONTROL_H) * 0.5;
-    let power = RectF::new(left, power_y, content_w, PROXY_CONTROL_H);
-    let metrics = RectF::new(left, header_bottom + band_h, content_w, band_h);
-    c.draw_line(left, metrics.y, metrics.right(), metrics.y, 1.0, theme::border_sub(), false);
-    paint_power_control(c, power, state, on, now);
+    let controls = RectF::new(left, header_bottom + 12.0, content_w, CONNECTION_CONTROLS_H);
+    c.fill_round_rect(controls, R_PANEL, theme::surface());
+    c.stroke_round_rect(controls, R_PANEL, 1.0, theme::border_sub());
+
+    let proxy_control = RectF::new(controls.x + 4.0, controls.y + 4.0, controls.w - 8.0, PROXY_CONTROL_H);
+    paint_proxy_control(c, proxy_control, state, on, now);
+    let steam_button = RectF::new(controls.x + 10.0, proxy_control.bottom() + 8.0, controls.w - 20.0, 32.0);
+    let action = Action::OpenOrRestartSteam;
+    let busy = state.steam_action.is_some();
+    let label = steam_button_label(state.steam_running, busy);
+    if busy {
+        paint_button_frame(c, steam_button, false, false);
+        c.draw_text(label, steam_button, state.fonts.badge, theme::text_dim(), DT_CENTER);
+    } else {
+        paint_button(c, &state.fonts, steam_button, label, false, state.hover == Some(action));
+        state.hits.push((steam_button, action));
+    }
 
     let fonts = &state.fonts;
     let title = RectF::new(left + 2.0, sidebar.y, content_w - 60.0, PANE_HEADER_H);
@@ -532,6 +623,8 @@ fn paint_connection_sidebar(
     c.draw_text("Kết nối", title, fonts.title, theme::text(), DT_LEFT);
     c.draw_text(DISPLAY_VERSION, version, fonts.mono, theme::text_muted(), DT_RIGHT);
 
+    let metrics_y = controls.bottom() + 8.0;
+    let metrics = RectF::new(left, metrics_y, content_w, doh_top - metrics_y);
     let (responding, failed) = paint_overview_metrics(c, metrics, fonts, snap, on, pending);
 
     let doh_label = RectF::new(left + 2.0, doh_top + 10.0, content_w - 4.0, 22.0);
@@ -578,41 +671,30 @@ fn paint_connection_sidebar(
     c.draw_text(&fallback, feedback, fonts.caption, color, DT_LEFT);
 }
 
-fn paint_power_control(c: &mut Canvas, area: RectF, state: &mut UiState, on: bool, now: Instant) {
+fn paint_proxy_control(c: &mut Canvas, area: RectF, state: &mut UiState, on: bool, now: Instant) {
     let fonts = &state.fonts;
     let hovered = state.hover == Some(Action::ToggleBypass);
     if hovered {
         c.fill_round_rect(area, R_BTN, theme::surface_hover());
     }
 
-    let content = area.inset(12.0, 0.0);
-    let center_x = content.x + content.w * 0.5;
-    let status_h = 22.0;
-    let endpoint_h = 18.0;
-    let track_h = 24.0;
-    let track_w = 48.0;
-    let switch_gap = 8.0;
-    let content_h = status_h + endpoint_h + switch_gap + track_h;
-    let top = content.cy() - content_h * 0.5;
-
+    let track = RectF::new(area.right() - 53.0, area.cy() - 11.0, 44.0, 22.0);
+    let text_x = area.x + 21.0;
+    let text_w = track.x - text_x - 8.0;
+    let status = RectF::new(text_x, area.cy() - 19.0, text_w, 21.0);
     let label = if on { "Proxy đang bật" } else { "Proxy đã tắt" };
-    let indicator_space = 14.0;
-    let label_w = c.measure_text(label, fonts.group).0.min(content.w - indicator_space);
-    let status_x = center_x - (indicator_space + label_w) * 0.5;
-    let status = RectF::new(status_x + indicator_space, top, label_w, status_h);
     let indicator = if on { theme::success() } else { theme::neutral() };
-    c.fill_circle(status_x + 3.0, status.cy(), 3.0, indicator);
+    c.fill_circle(area.x + 11.0, status.cy(), 3.0, indicator);
     c.draw_text(label, status, fonts.group, theme::text(), DT_LEFT);
 
-    let endpoint = RectF::new(content.x, status.bottom(), content.w, endpoint_h);
+    let endpoint = RectF::new(text_x, status.bottom(), text_w, 17.0);
     let address = if on { format!("127.0.0.1:{PORT}") } else { "Kết nối trực tiếp".into() };
     c.draw_text(
-        &address, endpoint, if on { fonts.mono } else { fonts.caption }, theme::text_muted(), DT_CENTER,
+        &address, endpoint, if on { fonts.mono } else { fonts.caption }, theme::text_muted(), DT_LEFT,
     );
 
-    let track = RectF::new(center_x - track_w * 0.5, endpoint.bottom() + switch_gap, track_w, track_h);
-    let position = state.motion.proxy.follow(u8::from(on) as f32, now, state.animations_enabled);
-    draw_mini_toggle(c, track, on, hovered, position);
+    let background = if hovered { theme::surface_hover() } else { theme::surface() };
+    state.motion.proxy.paint(c, ToggleFrame { track, background, hovered }, on, now, state.animations_enabled);
     state.hits.push((area, Action::ToggleBypass));
 }
 
@@ -687,6 +769,11 @@ fn paint_workspace_tabs(c: &mut Canvas, pane: RectF, state: &mut UiState, now: I
         pane.w - 2.0 * WORKSPACE_PAD, PANE_HEADER_H - 10.0);
     let rule_y = pane.y + PANE_HEADER_H;
     c.draw_line(pane.x + 1.0, rule_y, pane.right() - 1.0, rule_y, 1.0, theme::border_sub(), false);
+    state.motion.tab_bar = Some(bar);
+    paint_tab_bar(c, bar, state, now, true);
+}
+
+fn paint_tab_bar(c: &mut Canvas, bar: RectF, state: &mut UiState, now: Instant, record_hits: bool) {
     let item_w = bar.w / NAV_ITEMS.len() as f32;
     let tab_cell = |index: f32| RectF::new(bar.x + index * item_w, bar.y, item_w, bar.h);
     let selected_index = NAV_ITEMS.iter().position(|(tab, _)| *tab == state.tab).unwrap_or(0);
@@ -716,7 +803,29 @@ fn paint_workspace_tabs(c: &mut Canvas, pane: RectF, state: &mut UiState, now: I
         draw_nav_icon(c, tab, text_x - 15.0, cell.cy(), ink);
         c.draw_text(label, RectF::new(text_x, button.y, label_w + 4.0, button.h),
             state.fonts.body, ink, DT_LEFT);
-        state.hits.push((button, action));
+        if record_hits {
+            state.hits.push((button, action));
+        }
+    }
+}
+
+fn paint_motion_regions(hdc: HDC, state: &mut UiState, now: Instant) {
+    let mut c = Canvas::new(hdc, state.dpi);
+    if let Some(bar) = state.motion.pending_tab() {
+        c.fill_rect(bar, theme::surface_inset());
+        paint_tab_bar(&mut c, bar, state, now, false);
+        if let Some(focus @ Action::SelectTab(_)) = state.keyboard_focus {
+            if let Some((rect, _)) = state.hits.iter().find(|(_, action)| *action == focus) {
+                c.stroke_round_rect(rect.inset(2.0, 2.0), R_SM, 1.0, theme::info());
+            }
+        }
+    }
+    for switch in state.motion.switches() {
+        if let Some(frame) = switch.pending_frame() {
+            c.fill_rect(frame.bounds(), frame.background);
+            let position = switch.value.advance(now);
+            draw_mini_toggle(&mut c, frame.track, frame.hovered, position);
+        }
     }
 }
 
@@ -776,8 +885,9 @@ fn paint_utilities(c: &mut Canvas, card: RectF, state: &mut UiState, direct: boo
         if let Some((on, motion)) = switch {
             c.draw_text(if on { "Bật" } else { "Tắt" }, RectF::new(row.right() - 92.0, row.y, 35.0, row.h),
                 fonts.caption, theme::text_sec(), DT_RIGHT);
-            let position = motion.follow(u8::from(on) as f32, now, state.animations_enabled);
-            draw_mini_toggle(c, RectF::new(row.right() - 47.0, row.cy() - 10.0, 35.0, 20.0), on, hovered, position);
+            let track = RectF::new(row.right() - 47.0, row.cy() - 10.0, 35.0, 20.0);
+            let background = if hovered { theme::surface_hover() } else { theme::surface_inset() };
+            motion.paint(c, ToggleFrame { track, background, hovered }, on, now, state.animations_enabled);
             state.hits.push((row, action));
         } else {
             let busy = state.update.is_some();
@@ -818,17 +928,27 @@ fn paint_button(c: &mut Canvas, fonts: &FontSet, rect: RectF, label: &str, prima
         if primary { theme::on_primary() } else { theme::text() }, DT_CENTER);
 }
 
-fn draw_mini_toggle(c: &mut Canvas, r: RectF, on: bool, hovered: bool, position: f32) {
-    let track = match (on, hovered) {
-        (true, true) => theme::primary_hover(),
-        (true, false) => theme::primary(),
-        (false, true) => theme::text_dim(),
-        (false, false) => theme::neutral(),
+fn blend_color(from: Color, to: Color, progress: f32) -> Color {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * progress).round() as u8;
+    Color::rgb(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b))
+}
+
+fn draw_mini_toggle(c: &mut Canvas, r: RectF, hovered: bool, position: f32) {
+    let (off, on) = if hovered {
+        (theme::text_dim(), theme::primary_hover())
+    } else {
+        (theme::neutral(), theme::primary())
     };
+    let track = blend_color(off, on, position);
     c.fill_round_rect(r, r.h * 0.5, track);
     let radius = r.h * 0.5 - 2.5;
     let knob_x = r.x + r.h * 0.5 + (r.w - r.h) * position;
-    c.fill_circle(knob_x, r.cy(), radius, if on { theme::on_primary() } else { theme::switch_thumb() });
+    let thumb = blend_color(theme::switch_thumb(), theme::on_primary(), position);
+    c.fill_circle(knob_x, r.cy(), radius, thumb);
+    if (position > 0.0 && position < 1.0) && thumb.r.abs_diff(track.r) < 40 {
+        let outline = if track.r < 128 { Color::rgb(245, 245, 245) } else { Color::rgb(17, 17, 17) };
+        c.stroke_circle(knob_x, r.cy(), radius, 0.8, outline);
+    }
 }
 
 fn paint_steam_tab(
@@ -1200,7 +1320,7 @@ fn paint_custom_tab(
             let tg_h = 18.0;
             let tg_r = RectF::new(del_r.x - 10.0 - tg_w, rcy - tg_h * 0.5, tg_w, tg_h);
             let tg_hov = state.hover == Some(Action::ToggleCustomDomain(idx));
-            draw_mini_toggle(c, tg_r, item.enabled, tg_hov, u8::from(item.enabled) as f32);
+            draw_mini_toggle(c, tg_r, tg_hov, u8::from(item.enabled) as f32);
             let tht = (tg_r.y - 4.0).max(list_r.y);
             let thb = (tg_r.bottom() + 4.0).min(list_r.bottom());
             if thb > tht {
@@ -2352,11 +2472,63 @@ fn show_tray_menu(hwnd: HWND) {
             ID_MENU_DIRECT_CDN | ID_MENU_AUTOSTART | ID_DARK_MODE | ID_UPDATE
             | ID_EXPORT_CONFIG | ID_IMPORT_CONFIG => utility_command(hwnd, cmd_id),
             ID_MENU_RESET_NET => reset_network_ui(hwnd),
-            ID_MENU_EXIT => {
-                DestroyWindow(hwnd);
-            }
+            ID_MENU_EXIT => activate_action(hwnd, Action::QuitApp),
             _ => {}
         }
+    }
+}
+
+fn refresh_steam_status(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else { return };
+    if state.steam_action.is_none() {
+        if let Ok(running) = steam::is_running() {
+            if running != state.steam_running {
+                state.steam_running = running;
+                unsafe { InvalidateRect(hwnd, null(), 0); }
+            }
+        }
+    }
+}
+
+fn request_steam_action(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else { return };
+    if state.steam_action.is_some() {
+        return;
+    }
+    let request = if state.steam_running { steam::Request::Restart } else { steam::Request::Open };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let window = hwnd as usize;
+    match std::thread::Builder::new().spawn(move || {
+        if tx.send(steam::perform(request)).is_ok() {
+            unsafe { PostMessageW(window as HWND, WM_STEAM_DONE, 0, 0); }
+        }
+    }) {
+        Ok(_) => state.steam_action = Some(rx),
+        Err(_) => set_notice(hwnd, state, "Không thể xử lý yêu cầu Steam.".into(), theme::danger()),
+    }
+}
+
+fn finish_steam_action(hwnd: HWND) {
+    let Some(rx) = get_state(hwnd).and_then(|state| state.steam_action.take()) else { return };
+    refresh_steam_status(hwnd);
+    let Some(state) = get_state(hwnd) else { return };
+    let (message, color) = match rx.try_recv().unwrap_or(Err(steam::Error::Check)) {
+        Ok(steam::Outcome::Opened) => ("Đã gửi yêu cầu mở Steam.", theme::success()),
+        Ok(steam::Outcome::AlreadyOpen) => ("Steam đang mở.", theme::info()),
+        Ok(steam::Outcome::Restarted) => ("Đã gửi yêu cầu mở lại Steam.", theme::success()),
+        Err(error) => (match error {
+            steam::Error::Check => "Không thể kiểm tra Steam.",
+            steam::Error::NotInstalled => "Không tìm thấy Steam.",
+            steam::Error::Shutdown => "Không gửi được lệnh tắt Steam.",
+            steam::Error::Timeout => "Steam chưa thoát. Hãy thử lại.",
+            steam::Error::Launch => "Không thể mở Steam.",
+        }, theme::danger()),
+    };
+    if state.quit_after_steam_action {
+        unsafe { DestroyWindow(hwnd); }
+    } else {
+        set_notice(hwnd, state, message.into(), color);
+        unsafe { InvalidateRect(hwnd, null(), 0); }
     }
 }
 
@@ -2376,6 +2548,7 @@ fn activate_action(hwnd: HWND, action: Action) {
             close_doh_menu(hwnd);
             select_doh_ui(hwnd, provider);
         }
+        Action::OpenOrRestartSteam => request_steam_action(hwnd),
         Action::SelectTab(tab) => {
             if let Some(state) = get_state(hwnd) {
                 if state.tab != tab {
@@ -2433,6 +2606,14 @@ fn activate_action(hwnd: HWND, action: Action) {
         }
         Action::Utility(command) => utility_command(hwnd, command),
         Action::QuitApp => {
+            if let Some(state) = get_state(hwnd) {
+                if state.steam_action.is_some() {
+                    state.quit_after_steam_action = true;
+                    set_notice(hwnd, state, "Sẽ thoát khi Steam xử lý xong.".into(), theme::info());
+                    unsafe { InvalidateRect(hwnd, null(), 0); }
+                    return;
+                }
+            }
             unsafe { DestroyWindow(hwnd); }
             return;
         }
@@ -2680,24 +2861,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let ph = (cr.bottom - cr.top).max(1);
 
                 if let Some(state) = get_state(hwnd) {
-                    if state.paint_buffer.as_ref().is_none_or(|buffer| buffer.size != (pw, ph)) {
+                    let existing_buffer = state.paint_buffer.as_ref().is_some_and(|buffer| buffer.size == (pw, ph));
+                    let animation_only = std::mem::take(&mut state.repaint_motion_only) && existing_buffer;
+                    if !existing_buffer {
                         state.paint_buffer = PaintBuffer::new(hdc, pw, ph);
                     }
                     let target = state.paint_buffer.as_ref().map_or(hdc, |buffer| buffer.dc);
-                    let snap = proxy::snapshot();
-                    let custom_list = proxy::custom_domains();
-                    let on = ENABLED.load(Ordering::SeqCst);
-                    let direct_cdn = DIRECT_CDN.load(Ordering::SeqCst);
-                    let doh = proxy::doh_provider();
-                    let pending = PENDING.load(Ordering::SeqCst);
                     let frame_started = Instant::now();
-                    paint_ui(target, pw, ph, state, &snap, &custom_list, on, direct_cdn, doh, pending, frame_started);
+                    if animation_only {
+                        paint_motion_regions(target, state, frame_started);
+                    } else {
+                        let snap = proxy::snapshot();
+                        let custom_list = proxy::custom_domains();
+                        let on = ENABLED.load(Ordering::SeqCst);
+                        let direct_cdn = DIRECT_CDN.load(Ordering::SeqCst);
+                        let doh = proxy::doh_provider();
+                        let pending = PENDING.load(Ordering::SeqCst);
+                        paint_ui(target, pw, ph, state, &snap, &custom_list, on, direct_cdn, doh, pending, frame_started);
+                    }
                     if target != hdc {
                         let paint = ps.rcPaint;
                         BitBlt(hdc, paint.left, paint.top, paint.right - paint.left, paint.bottom - paint.top,
                             target, paint.left, paint.top, SRCCOPY);
                     }
-                    state.sync_motion_timer(hwnd, frame_started);
+                    state.sync_motion_timer(hwnd);
                 }
 
                 EndPaint(hwnd, &ps);
@@ -2805,6 +2992,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 InvalidateRect(hwnd, null(), 0);
                 0
             }
+            WM_TIMER if wp == ID_TIMER_STEAM => {
+                if IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                    refresh_steam_status(hwnd);
+                }
+                0
+            }
             WM_POWERBROADCAST => {
                 if wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND {
                     proxy::on_system_resume();
@@ -2830,6 +3023,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     InvalidateRect(hwnd, null(), 0);
                     MessageBoxW(hwnd, wide(&message).as_ptr(), wide("Kiểm tra cập nhật").as_ptr(), MB_OK);
                 }
+                0
+            }
+            WM_STEAM_DONE => {
+                finish_steam_action(hwnd);
                 0
             }
             WM_APP_ADD_DOMAIN => {
@@ -2885,6 +3082,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_DESTROY => {
                 KillTimer(hwnd, ID_TIMER_NOTICE);
                 KillTimer(hwnd, ID_TIMER_MOTION);
+                KillTimer(hwnd, ID_TIMER_STEAM);
                 delete_tray(hwnd);
                 proxy::set_enabled(false);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut UiState;
@@ -2901,7 +3099,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn paint_motion_frame(hwnd: HWND) {
     unsafe {
-        RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_NOCHILDREN);
+        // Normal invalidations take precedence over an animation-only update.
+        if GetUpdateRect(hwnd, null_mut(), 0) != 0 {
+            UpdateWindow(hwnd);
+            return;
+        }
+        let Some(state) = get_state(hwnd) else { return };
+        if state.paint_buffer.is_none() || state.doh_menu_focus.is_some() {
+            RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_NOCHILDREN);
+            return;
+        }
+        if state.motion.pending_regions().next().is_none() {
+            state.cancel_motion_timer(hwnd);
+            return;
+        }
+        let scale = state.dpi as f32 / 96.0;
+        for bounds in state.motion.pending_regions() {
+            InvalidateRect(hwnd, &bounds.to_gdi_rect(scale), 0);
+        }
+        state.repaint_motion_only = true;
+        UpdateWindow(hwnd);
+        if let Some(state) = get_state(hwnd) {
+            state.repaint_motion_only = false;
+        }
     }
 }
 
@@ -2917,9 +3137,7 @@ fn next_ui_message(hwnd: HWND, msg: &mut MSG) -> bool {
         let wake = unsafe {
             MsgWaitForMultipleObjectsEx(1, &timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
         };
-        if wake == WAIT_OBJECT_0 {
-            paint_motion_frame(hwnd);
-        } else if wake == WAIT_FAILED {
+        if wake == WAIT_FAILED {
             if let Some(state) = get_state(hwnd) {
                 state.stop_motion(hwnd);
                 unsafe { CloseHandle(state.frame_timer); }
@@ -2928,9 +3146,12 @@ fn next_ui_message(hwnd: HWND, msg: &mut MSG) -> bool {
             unsafe { InvalidateRect(hwnd, null(), 0); }
         }
 
-        // Service input between frames, including when a tick and input arrive together.
+        // Apply queued input before presenting another animation frame.
         if unsafe { PeekMessageW(msg, null_mut(), 0, 0, PM_REMOVE) } != 0 {
             return msg.message != WM_QUIT;
+        }
+        if wake == WAIT_OBJECT_0 {
+            paint_motion_frame(hwnd);
         }
     }
 }
@@ -3052,6 +3273,8 @@ pub fn run(start_minimized: bool, startup_notice: Option<(&str, bool)>) {
 
         add_tray(hwnd);
         proxy::set_ui_hwnd(hwnd);
+        refresh_steam_status(hwnd);
+        SetTimer(hwnd, ID_TIMER_STEAM, 1500, None);
         if let Some((text, success)) = startup_notice {
             if let Some(state) = get_state(hwnd) {
                 set_notice(hwnd, state, text.into(), if success { theme::success() } else { theme::danger() });
@@ -3181,6 +3404,9 @@ mod tests {
             assert!(provider_button.bottom() < sidebar.bottom());
             assert_eq!(has_action(Action::RunTest), on);
             assert_eq!(has_action(Action::FocusInput), tab == Tab::Custom);
+            let (steam, _) = state.hits.iter().find(|(_, action)| *action == Action::OpenOrRestartSteam).unwrap();
+            assert!(switch.bottom() < steam.y && steam.bottom() < provider_button.y);
+            assert!(hit_test(&state, steam.x + steam.w * 0.5, steam.cy()) == Some(Action::OpenOrRestartSteam));
             if tab == Tab::Utilities {
                 let dark_mode = Action::Utility(ID_DARK_MODE);
                 let mut switches = state.hits.iter().filter(|(_, action)| *action == dark_mode);
@@ -3203,7 +3429,7 @@ mod tests {
             for (bounds, action) in &state.hits {
                 assert!(bounds.x >= 0.0 && bounds.right() <= size.0);
                 assert!(bounds.y >= 0.0 && bounds.bottom() <= size.1);
-                if matches!(action, Action::ToggleBypass | Action::OpenDohMenu | Action::RunTest) {
+                if matches!(action, Action::ToggleBypass | Action::OpenOrRestartSteam | Action::OpenDohMenu | Action::RunTest) {
                     assert!(bounds.right() <= sidebar.right());
                 } else {
                     assert!(bounds.x >= workspace.x && bounds.right() <= workspace.right());
@@ -3359,6 +3585,14 @@ mod tests {
     }
 
     #[test]
+    fn steam_button_tracks_client_and_request_state() {
+        assert_eq!(steam_button_label(false, false), "Mở Steam");
+        assert_eq!(steam_button_label(true, false), "Khởi động lại Steam");
+        assert_eq!(steam_button_label(false, true), "Đang mở Steam…");
+        assert_eq!(steam_button_label(true, true), "Đang khởi động lại…");
+    }
+
+    #[test]
     fn keyboard_switches_workspace_tabs() {
         unsafe {
             let window = CreateWindowExW(
@@ -3461,23 +3695,64 @@ mod tests {
         let now = Instant::now();
         let mut value = MotionValue::default();
         assert_eq!(value.follow(0.0, now, true), 0.0);
-        assert!(!value.active(now));
+        assert!(value.transition.is_none());
 
         assert_eq!(value.follow(1.0, now, true), 0.0);
         let quarter = value.position(now + MOTION_DURATION / 4);
-        assert!(quarter > 0.0 && quarter < 0.25);
+        assert!(quarter > 0.25 && quarter < 0.5);
         let midway = now + MOTION_DURATION / 2;
         let position = value.follow(1.0, midway, true);
-        assert!((position - 0.5).abs() < 0.001);
+        assert!((position - 0.75).abs() < 0.001);
         assert_eq!(value.follow(0.0, midway, true), position);
+        assert!(value.transition.as_ref().unwrap().duration < MOTION_DURATION);
+        assert!(value.position(midway + Duration::from_millis(16)) < position);
         let settled = midway + MOTION_DURATION;
-        assert_eq!(value.position(settled), 0.0);
-        assert!(!value.active(settled));
+        assert_eq!(value.advance(settled), 0.0);
+        assert!(value.transition.is_none());
 
         value.follow(1.0, settled, true);
-        assert!(value.active(settled));
+        assert!(value.transition.is_some());
         assert_eq!(value.follow(1.0, settled, false), 1.0);
-        assert!(!value.active(settled));
+        assert!(value.transition.is_none());
+    }
+
+    #[test]
+    fn motion_frames_repaint_controls_and_preserve_service_pixels() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let dpi = 144;
+        let scale = dpi as f32 / 96.0;
+        let pw = (MIN_W * scale) as i32;
+        let ph = (MIN_H * scale) as i32;
+        write_preview_bmp(&format!(r"{dir}\target\preview_motion_regions.bmp"), pw, ph, |dc| {
+            let mut state = UiState::new(dpi, false, false, 0);
+            state.animations_enabled = true;
+            let snap = sample_snap(false);
+            let now = Instant::now();
+            paint_ui(dc, pw, ph, &mut state, &snap, &[], false, false, DohProvider::Google, 0, now);
+            state.tab = Tab::Utilities;
+            paint_ui(dc, pw, ph, &mut state, &snap, &[], true, false, DohProvider::Google, 0, now);
+            assert_eq!(state.motion.pending_regions().count(), 2);
+            let hits = state.hits.len();
+            let track = state.motion.proxy.frame.unwrap().track;
+            let track_x = ((track.right() - 6.0) * scale).round() as i32;
+            let track_y = (track.cy() * scale).round() as i32;
+            let original = unsafe { GetPixel(dc, track_x, track_y) };
+            let (_, workspace) = split_layout(MIN_W, MIN_H);
+            let content = workspace_content(workspace);
+            let marker_x = ((content.x + 48.0) * scale).round() as i32;
+            let marker_y = (content.cy() * scale).round() as i32;
+            let marker = Color::rgb(19, 83, 137).colorref();
+            unsafe { SetPixel(dc, marker_x, marker_y, marker); }
+
+            paint_motion_regions(dc, &mut state, now + MOTION_DURATION / 2);
+            assert_ne!(unsafe { GetPixel(dc, track_x, track_y) }, original);
+            assert_eq!(unsafe { GetPixel(dc, marker_x, marker_y) }, marker);
+            assert_eq!(state.hits.len(), hits);
+
+            paint_motion_regions(dc, &mut state, now + MOTION_DURATION * 2);
+            assert!(state.motion.pending_regions().next().is_none());
+            assert_eq!(unsafe { GetPixel(dc, marker_x, marker_y) }, marker);
+        });
     }
 
     #[test]

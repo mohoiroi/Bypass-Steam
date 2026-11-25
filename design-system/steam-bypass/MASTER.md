@@ -15,13 +15,15 @@
 
 ## Windows desktop
 
-The 832 × 468 DIP window opens with Steam selected. The connection panel is 210–228 DIP wide and aligns with the workspace at the top and bottom. The clickable proxy control stacks the status, address and switch on the panel's centerline. A divider separates the two centered metrics below the control. A small unit label follows the latency value. The DoH selector, connection check and feedback form a section at the bottom. The connected status dot uses green.
+The 832 × 468 DIP window opens with Steam selected. The connection panel is 210–228 DIP wide and aligns with the workspace at the top and bottom. A shared card places the proxy status and address on the left, the switch on the right and the Steam action below. The two centered metrics share a divider below the card, and a small unit label follows the latency value. The DoH selector, connection check and feedback form a section at the bottom. The connected status dot uses green.
 
 The DoH selector opens a compact rounded panel above the button. Each provider shows its name and a smaller, muted address aligned to the right on the same line. The active name uses blue text, and a divider leads to the one-line Custom DoH action. The arrow keys browse the list and Escape returns focus to the selector. Custom DoH opens a compact 234 × 94 dialog-unit form. Feedback sits below the URL field. The footer actions are Hủy, Thử kết nối and Lưu và áp dụng in that order.
 
 The right pane has tabs for Steam, Web khác and Tiện ích. Steam uses 48 DIP service rows with a separate line for descriptions. Expand a group to see per-host details. Web khác contains domain management. Tiện ích uses switches for CDN, startup and dark mode, with a separate button for checking updates. The shared pane footer places Thoát at the lower right on every tab. The window supports both columns down to 716 × 440 DIP.
 
-The selected tab background and the switch thumbs in Kết nối and Tiện ích ease in and out over 220 ms. Text and hit targets use fixed positions during each transition. The app follows the Windows animation preference.
+The Steam action label reflects whether Steam is open. While a request is pending, the action keeps its width and displays progress at the same position.
+
+The tab indicator and switches in Kết nối and Tiện ích ease out over about 190 ms for a full step. Shorter distances settle sooner, and switch colors follow the thumb position. The app redraws the animated areas while keeping text and hit targets in place. It follows the Windows animation preference.
 
 Tiện ích places configuration backup in one row with Xuất tệp and Nhập tệp as adjacent outline buttons. Windows owns file selection and overwrite confirmation. Import shows the number of domains and asks before replacing settings. The shared pane footer reports backup and startup recovery outcomes.
 
